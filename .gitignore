@@ -1,0 +1,9 @@
+# Build output
+PitBoard.app/
+
+# macOS
+.DS_Store
+
+# Personal menu bar icon — kept locally, not distributed
+MenuIcon.png
+MenuIcon@2x.png
