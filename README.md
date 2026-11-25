@@ -34,3 +34,7 @@ Put your own `MenuIcon.png` (13 px tall) and `MenuIcon@2x.png` (26 px tall) next
 - Circuit maps: loaded at runtime from each race page on formula1.com and cached in `~/Library/Caches/PitBoard`. No images are included in this repository.
 
 PitBoard is an unofficial fan project and is not affiliated with Formula 1, the FIA or any team. F1, FORMULA 1 and related marks are trademarks of Formula One Licensing B.V.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The license covers this project's code only.

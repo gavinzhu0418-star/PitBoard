@@ -1,5 +1,5 @@
 #!/bin/bash
-# 编译 PitBoard.app（需要 Xcode 命令行工具；没有的话先运行 xcode-select --install）
+# Build PitBoard.app (needs the Xcode Command Line Tools: xcode-select --install)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -8,7 +8,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O -swift-version 5 -parse-as-library PitBoard.swift -o "$APP/Contents/MacOS/PitBoard"
-# 菜单栏图标：有 MenuIcon.png / MenuIcon@2x.png 就拷进去，没有就显示 🏁
+# Menu bar icon: copy MenuIcon.png / MenuIcon@2x.png if present; without them the menu bar shows 🏁
 for f in MenuIcon.png MenuIcon@2x.png; do
     if [ -f "$f" ]; then cp -X "$f" "$APP/Contents/Resources/"; fi
 done
@@ -37,4 +37,4 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --sign - "$APP"
-echo "已生成 $(pwd)/$APP"
+echo "Built $(pwd)/$APP"

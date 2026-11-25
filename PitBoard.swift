@@ -1,16 +1,17 @@
-// PitBoard — 菜单栏里的赛程小工具
-// 点一下菜单栏图标：联网同步本赛季赛程。下拉面板左边是这一站的官方赛道图（从 F1 官网这一站的比赛页面里找图，
-// 下载后缓存在本地；鼠标移到图上，图会平滑放大盖住整块面板，离开面板再缩回），右边是第几站、各节时间
-// （按本机时区）和倒计时，底下是同步状态和按钮。
-// 赛程数据：Jolpica F1 API（Ergast 的继任者）https://api.jolpi.ca/ergast/f1/
+// PitBoard — a menu bar app for F1 race weekends
+// Click the menu bar icon to sync this season's schedule. The panel shows the official circuit map for the
+// current round on the left (found on that round's formula1.com race page, downloaded once and cached; hover
+// over it and it smoothly grows to cover the whole panel), the round, every session in local time and a
+// countdown on the right, and the sync status and buttons along the bottom.
+// Schedule data: Jolpica F1 API (the Ergast successor) https://api.jolpi.ca/ergast/f1/
 //
-// 编译：./build.sh（需要 Xcode 命令行工具）
-// 不开界面、直接打印同步结果和赛道图地址：./PitBoard.app/Contents/MacOS/PitBoard --print
+// Build: ./build.sh (needs the Xcode Command Line Tools)
+// Print the synced data and the map URL without the UI: ./PitBoard.app/Contents/MacOS/PitBoard --print
 
 import AppKit
 import ServiceManagement
 
-// MARK: - 数据模型（对应 API 返回的 JSON）
+// MARK: - Models (match the API's JSON)
 
 struct Slot: Codable {
     let date: String
@@ -59,7 +60,7 @@ struct Season: Codable {
     let races: [Race]
 }
 
-/// API 外面包了几层：MRData → RaceTable → Races
+/// The API wraps the races in a few layers: MRData → RaceTable → Races
 struct ScheduleResponse: Decodable {
     let races: [Race]
 
@@ -75,7 +76,7 @@ struct ScheduleResponse: Decodable {
     }
 }
 
-// MARK: - 时间
+// MARK: - Time
 
 struct Session {
     let name: String
@@ -87,7 +88,7 @@ struct Session {
 
 let isoFormatter = ISO8601DateFormatter()
 
-/// "2026-11-29" + "16:00:00Z" → Date；还没公布具体时间的按当天中午（UTC）算
+/// "2026-11-29" + "16:00:00Z" → Date; a session without a published time counts as noon UTC that day
 func makeDate(_ date: String, _ time: String?) -> (date: Date, timeKnown: Bool)? {
     if let time = time {
         let t = time.hasSuffix("Z") ? time : time + "Z"
@@ -114,13 +115,13 @@ extension Race {
         return list.sorted { $0.start < $1.start }
     }
 
-    /// 正赛开始 3 小时后这一站算结束，切到下一站
+    /// A round counts as finished 3 hours after the race starts; then the next round takes over
     var finishedBy: Date {
         (makeDate(date, time)?.date ?? .distantPast).addingTimeInterval(3 * 3600)
     }
 }
 
-/// 例如 "Sat 28 Nov"
+/// e.g. "Sat 28 Nov"
 let dayFormatter: DateFormatter = {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_AU")
@@ -140,7 +141,7 @@ func describe(_ s: Session) -> String {
     return s.timeKnown ? "\(day)  \(clockFormatter.string(from: s.start))" : "\(day)  TBC"
 }
 
-/// 例如 "2d 3h"、"5h 20m"、"12m"
+/// e.g. "2d 3h", "5h 20m", "12m"
 func countdown(_ interval: TimeInterval) -> String {
     let m = Int(interval / 60)
     if m < 1 { return "<1m" }
@@ -155,7 +156,7 @@ func short(_ raceName: String) -> String {
     raceName.replacingOccurrences(of: "Grand Prix", with: "GP")
 }
 
-// MARK: - 菜单内容
+// MARK: - Panel content
 
 enum Row {
     case header(String)
@@ -173,7 +174,7 @@ enum Row {
     }
 }
 
-/// 第一个还没结束的大奖赛 = 当前站（比赛周末进行中）或下一站
+/// The first Grand Prix that hasn't finished = the current round (race weekend under way) or the next one
 func pick(_ seasons: [Season], now: Date = Date()) -> (current: (race: Race, total: Int)?, previous: Race?) {
     var previous: Race?
     for season in seasons.sorted(by: { $0.year < $1.year }) {
@@ -237,7 +238,7 @@ func buildRows(_ seasons: [Season], now: Date = Date()) -> [Row] {
     return rows
 }
 
-// MARK: - 网络同步和缓存
+// MARK: - Sync and cache
 
 struct HTTPStatusError: LocalizedError {
     let code: Int
@@ -256,7 +257,7 @@ enum API {
         return Season(year: year, races: races)
     }
 
-    /// 拉今年的赛程；今年已经没有比赛了就再拉明年的，这样赛季结束后会显示下赛季揭幕战
+    /// Fetch this year's schedule; if no races are left, fetch next year's too so the season opener shows after the finale
     static func sync(now: Date = Date()) async throws -> [Season] {
         let year = Calendar(identifier: .gregorian).component(.year, from: now)
         let this = try await season(year)
@@ -289,7 +290,7 @@ enum Store {
     }
 }
 
-// MARK: - 赛道图（F1 官网比赛页上的 detailed 赛道图）
+// MARK: - Circuit map (the "detailed" map on each formula1.com race page)
 
 struct MapError: LocalizedError {
     let message: String
@@ -297,8 +298,9 @@ struct MapError: LocalizedError {
 }
 
 enum TrackMap {
-    /// 比赛页地址 https://www.formula1.com/en/racing/<年份>/<slug> 的候选 slug，按顺序试。
-    /// 大多数是国家名；几个例外单独列出；最后再试比赛名（例如 2026 年在马来西亚办的巴林站，官网仍是 bahrain）
+    /// Candidate slugs for the race page https://www.formula1.com/en/racing/<year>/<slug>, tried in order.
+    /// Mostly the country name; a few exceptions are listed; the race name comes last
+    /// (e.g. the 2026 Bahrain GP held in Malaysia still lives at "bahrain")
     static func pageSlugs(_ race: Race) -> [String] {
         func slug(_ s: String) -> String {
             s.folding(options: .diacriticInsensitive, locale: nil)
@@ -334,7 +336,7 @@ enum TrackMap {
         throw failure
     }
 
-    /// 在比赛页的 HTML 里找 …/track/<年份>track<赛道>detailed.webp 这张图
+    /// Find …/track/<year>track<circuit>detailed.webp in the race page's HTML
     static func findImage(on page: URL) async throws -> URL? {
         let (data, response) = try await URLSession.shared.data(from: page)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
@@ -353,7 +355,7 @@ enum TrackMap {
         return dir
     }()
 
-    /// 先看本地缓存，没有再从官网下载
+    /// Use the local cache first; download from formula1.com only when it's missing
     static func image(for race: Race) async throws -> NSImage {
         let file = folder.appendingPathComponent("\(race.season)-\(race.round)")
         if let data = try? Data(contentsOf: file), let image = NSImage(data: data) { return image }
@@ -368,7 +370,7 @@ enum TrackMap {
     }
 }
 
-/// 赛道图内容整体偏亮（比如白色线条）就配深色底，否则配白底，保证看得清
+/// A mostly light map (e.g. white lines) gets a dark card, anything else a white one, so it stays readable
 func wantsDarkBackground(_ image: NSImage) -> Bool {
     guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
     let side = 48
@@ -383,16 +385,16 @@ func wantsDarkBackground(_ image: NSImage) -> Bool {
     for i in stride(from: 0, to: pixels.count, by: 4) {
         let alpha = Double(pixels[i + 3]) / 255
         guard alpha > 0.05 else { continue }
-        // 像素是预乘过 alpha 的，直接累加再除以 alpha 总和就是按不透明度加权的平均亮度
+        // Pixels are premultiplied, so their sum divided by the total alpha is the alpha-weighted mean brightness
         sum += (0.299 * Double(pixels[i]) + 0.587 * Double(pixels[i + 1]) + 0.114 * Double(pixels[i + 2])) / 255
         weight += alpha
     }
     return weight > 0 && sum / weight > 0.6
 }
 
-// MARK: - 下拉面板
+// MARK: - Dropdown panel
 
-/// 赛道图卡片。平时在面板左边；放大时卡片平滑长大到盖住整块面板（Core Animation 动画）
+/// Circuit map card. Normally on the left of the panel; on hover it smoothly grows to cover the whole panel (Core Animation)
 final class MapView: NSView {
     private let card = CALayer()
     private let picture = CALayer()
@@ -403,7 +405,7 @@ final class MapView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        // 自己提供图层（layer-hosting），卡片和图片都是独立图层，方便做动画
+        // Layer-hosting view: the card and the picture are standalone layers, which keeps them easy to animate
         layer = CALayer()
         wantsLayer = true
         card.cornerRadius = 10
@@ -428,7 +430,8 @@ final class MapView: NSView {
         return nil
     }
 
-    // 这个视图铺满整块面板：平时让点击穿过去（底下有按钮），放大时挡住点击
+    // This view covers the whole panel: clicks pass through normally (the buttons are underneath)
+    // and are blocked while the map is enlarged
     override func hitTest(_ point: NSPoint) -> NSView? {
         expanded ? super.hitTest(point) : nil
     }
@@ -436,7 +439,7 @@ final class MapView: NSView {
     override func mouseDown(with event: NSEvent) {}
     override func mouseUp(with event: NSEvent) {}
 
-    /// 放大时卡片四周留 6pt 边
+    /// When enlarged, the card keeps a 6 pt margin
     private var expandedRect: CGRect {
         bounds.insetBy(dx: 6, dy: 6)
     }
@@ -448,7 +451,7 @@ final class MapView: NSView {
         caption.frame = CGRect(x: 0, y: card.bounds.midY - 8, width: card.bounds.width, height: 16)
     }
 
-    /// rect：平时卡片的位置（本视图坐标）；image 为 nil 时显示“加载中”的占位卡片
+    /// rect: the card's normal position (this view's coordinates); a nil image shows the loading placeholder
     func show(_ image: NSImage?, at rect: CGRect) {
         let fadeIn = !hasImage && image != nil
         hasImage = image != nil
@@ -477,7 +480,7 @@ final class MapView: NSView {
         }
     }
 
-    /// 放大 0.35 秒、缩回 0.25 秒，都是先快后慢的缓动；图片按原比例跟着卡片一起变大
+    /// Grows in 0.35 s and shrinks in 0.25 s, both easing out; the picture keeps its aspect ratio as the card grows
     func setExpanded(_ on: Bool, animated: Bool = true) {
         if on && !hasImage { return }
         if animated && on == expanded { return }
@@ -495,9 +498,9 @@ final class MapView: NSView {
     }
 }
 
-/// 整个下拉面板：左边赛道图，右边赛程信息，底下一排状态和按钮。
-/// 它是菜单里唯一的一项，所以和菜单同时出现、同时消失。
-/// 鼠标移到赛道图上 → 图放大盖住整块面板；鼠标离开面板 → 缩回。
+/// The whole dropdown panel: circuit map on the left, schedule on the right, status and buttons along the bottom.
+/// It is the menu's only item, so it appears and disappears together with the menu.
+/// Pointer enters the map → the map grows to cover the panel; pointer leaves the panel → it shrinks back.
 final class DashboardView: NSView {
     static let mapWidth: CGFloat = 360
     let map = MapView(frame: .zero)
@@ -512,7 +515,7 @@ final class DashboardView: NSView {
     private lazy var loginBox = NSButton(checkboxWithTitle: "Launch at Login", target: self, action: #selector(loginClicked))
     private lazy var syncButton = NSButton(title: "Sync Now", target: self, action: #selector(syncClicked))
     private lazy var quitButton = NSButton(title: "Quit", target: self, action: #selector(quitClicked))
-    private var mapRect = NSRect.zero   // 赛道图平时的位置（本视图坐标，左上角是原点）
+    private var mapRect = NSRect.zero   // the map's normal position (this view's coordinates, origin top left)
     private var mapArea: NSTrackingArea?
     private var panelArea: NSTrackingArea?
 
@@ -547,7 +550,7 @@ final class DashboardView: NSView {
         let pad: CGFloat = 14, gap: CGFloat = 18
         let infoX = showMap ? pad + Self.mapWidth + gap : pad
 
-        // 右边：赛程信息从上往下排
+        // Right: schedule rows, top to bottom
         var y = pad
         var infoWidth: CGFloat = 230
         for (row, view) in zip(rows, labels) {
@@ -567,14 +570,14 @@ final class DashboardView: NSView {
         }
         let infoHeight = y - pad
 
-        // 左边：赛道图，宽度固定，高度跟图片比例走，和右边顶部对齐
+        // Left: circuit map, fixed width, height from the image's aspect ratio, top-aligned with the right column
         var mapHeight: CGFloat = 0
         if showMap {
             let ratio = image.map { $0.size.height / max($0.size.width, 1) } ?? 0.7
             mapHeight = min(max(Self.mapWidth * ratio, 180), 360)
         }
 
-        // 底部：（赛道图出错时的提示）+ 分隔线 + 左边状态、右边按钮
+        // Bottom: (map error note) + separator + status on the left, buttons on the right
         loginBox.state = loginOn ? .on : .off
         statusLabel.stringValue = status
         noteLabel.stringValue = note ?? ""
@@ -608,12 +611,12 @@ final class DashboardView: NSView {
 
         setFrameSize(NSSize(width: width, height: bottom))
 
-        // 赛道图视图铺满整块面板并放在最上层，放大时才能盖住所有内容
+        // The map view covers the whole panel and sits on top, so the enlarged map covers everything
         if showMap {
             mapRect = NSRect(x: pad, y: pad, width: Self.mapWidth, height: mapHeight)
             map.frame = bounds
             addSubview(map, positioned: .above, relativeTo: nil)
-            // MapView 的坐标原点在左下角，这里换算一下
+            // MapView's origin is at the bottom left, so convert
             map.show(image, at: CGRect(x: mapRect.minX, y: bounds.height - mapRect.maxY,
                                        width: mapRect.width, height: mapRect.height))
         } else {
@@ -623,7 +626,7 @@ final class DashboardView: NSView {
         updateTrackingAreas()
     }
 
-    // 两个感应区：进入赛道图区域就放大；离开整块面板才缩回
+    // Two tracking areas: entering the map enlarges it; only leaving the whole panel shrinks it back
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let area = mapArea { removeTrackingArea(area) }
@@ -631,7 +634,7 @@ final class DashboardView: NSView {
         mapArea = nil
         panelArea = nil
         guard map.superview != nil else { return }
-        // 菜单打开时 App 不是前台，所以要 activeAlways
+        // The app isn't active while its menu is open, hence activeAlways
         let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways]
         let mapZone = NSTrackingArea(rect: mapRect, options: options, owner: self, userInfo: nil)
         let panelZone = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
@@ -691,7 +694,7 @@ final class DashboardView: NSView {
     }
 }
 
-// MARK: - 菜单栏
+// MARK: - Menu bar
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -701,7 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var syncing = false
     private var lastError: String?
 
-    // 菜单里只有一项：整块下拉面板（自定义视图）
+    // The menu has a single item: the whole dropdown panel (a custom view)
     private let dashboard = DashboardView(frame: NSRect(x: 0, y: 0, width: 300, height: 100))
     private let dashboardItem = NSMenuItem()
     private var maps: [String: NSImage] = [:]
@@ -709,7 +712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mapError: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 图标是 App 里 Resources/MenuIcon.png（和 @2x），由 build.sh 拷进去
+        // Icon: Resources/MenuIcon.png (and @2x) inside the app, copied there by build.sh
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let logo = Bundle.main.image(forResource: "MenuIcon") {
             statusItem.button?.image = logo
@@ -730,7 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sync()
     }
 
-    // 每次点开前重画，倒计时是最新的
+    // Rebuild every time the menu opens so the countdown is current
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenu()
     }
@@ -738,7 +741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         dashboard.map.setExpanded(false, animated: false)
         loadMap()
-        // 数据超过 10 分钟就重新同步
+        // Re-sync when the data is more than 10 minutes old
         if let t = cache?.fetchedAt, Date().timeIntervalSince(t) < 600 { return }
         sync()
     }
@@ -767,7 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // MARK: 赛道图
+    // MARK: Circuit map
 
     private var currentRace: Race? {
         cache.flatMap { pick($0.seasons).current?.race }
@@ -795,7 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // MARK: 面板内容
+    // MARK: Panel content
 
     private func rebuildMenu() {
         let race = currentRace
@@ -842,13 +845,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// MARK: - 入口
+// MARK: - Entry point
 
 @main
 struct PitBoardMain {
     @MainActor
     static func main() {
-        // 测试用：不开界面，同步一次后把菜单内容和赛道图地址打印出来
+        // For testing: sync once without the UI, then print the panel content and the map URL
         if CommandLine.arguments.contains("--print") {
             Task {
                 do {
