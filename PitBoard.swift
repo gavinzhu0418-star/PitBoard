@@ -2,11 +2,15 @@
 // Click the menu bar icon to sync this season's schedule. The panel shows the official circuit map for the
 // current round on the left (found on that round's formula1.com race page, downloaded once and cached; hover
 // over it and it smoothly grows to cover the whole panel), the round, every session in local time and a
-// countdown on the right, and the sync status and buttons along the bottom.
-// Schedule data: Jolpica F1 API (the Ergast successor) https://api.jolpi.ca/ergast/f1/
+// countdown on the right. Under them: constructor standings, the top 10 drivers, and the top 10
+// of the latest finished session. Sync status and buttons along the bottom.
+//
+// Data: schedule and standings from the Jolpica F1 API (the Ergast successor) https://api.jolpi.ca/ergast/f1/;
+// latest session results and team colours from OpenF1 https://openf1.org; circuit maps are loaded at
+// runtime from formula1.com and cached locally.
 //
 // Build: ./build.sh (needs the Xcode Command Line Tools)
-// Print the synced data and the map URL without the UI: ./PitBoard.app/Contents/MacOS/PitBoard --print
+// Print the synced data without the UI: ./PitBoard.app/Contents/MacOS/PitBoard --print
 
 import AppKit
 import ServiceManagement
@@ -74,6 +78,140 @@ struct ScheduleResponse: Decodable {
             .nestedContainer(keyedBy: TableKeys.self, forKey: .raceTable)
         races = try table.decode([Race].self, forKey: .races)
     }
+}
+
+// MARK: - Standings models (Jolpica)
+
+struct StandingDriver: Codable {
+    let driverId: String
+    let code: String?
+    let familyName: String
+}
+
+struct StandingConstructor: Codable {
+    let constructorId: String
+    let name: String
+}
+
+struct DriverStanding: Codable {
+    let position: String?
+    let points: String
+    let driver: StandingDriver
+    let constructors: [StandingConstructor]
+
+    enum CodingKeys: String, CodingKey {
+        case position, points
+        case driver = "Driver"
+        case constructors = "Constructors"
+    }
+}
+
+struct TeamStanding: Codable {
+    let position: String?
+    let points: String
+    let constructor: StandingConstructor
+
+    enum CodingKeys: String, CodingKey {
+        case position, points
+        case constructor = "Constructor"
+    }
+}
+
+/// MRData → StandingsTable → StandingsLists[0] → DriverStandings or ConstructorStandings
+struct StandingsResponse<Item: Codable>: Decodable {
+    let round: Int
+    let items: [Item]
+
+    private enum Keys: String, CodingKey {
+        case mrData = "MRData", table = "StandingsTable", lists = "StandingsLists", round
+        case drivers = "DriverStandings", teams = "ConstructorStandings"
+    }
+
+    init(from decoder: Decoder) throws {
+        var lists = try decoder.container(keyedBy: Keys.self)
+            .nestedContainer(keyedBy: Keys.self, forKey: .mrData)
+            .nestedContainer(keyedBy: Keys.self, forKey: .table)
+            .nestedUnkeyedContainer(forKey: .lists)
+        guard !lists.isAtEnd else {
+            round = 0
+            items = []
+            return
+        }
+        let first = try lists.nestedContainer(keyedBy: Keys.self)
+        round = Int(try first.decodeIfPresent(String.self, forKey: .round) ?? "") ?? 0
+        items = try first.decodeIfPresent([Item].self, forKey: .drivers)
+            ?? first.decodeIfPresent([Item].self, forKey: .teams) ?? []
+    }
+}
+
+struct Standings: Codable {
+    let season: Int
+    let round: Int
+    let drivers: [DriverStanding]
+    let teams: [TeamStanding]
+}
+
+// MARK: - Session result models (OpenF1, decoded with convertFromSnakeCase)
+
+struct OFSession: Codable {
+    let sessionKey: Int
+    let sessionName: String
+    let dateEnd: String?
+    let location: String?
+    let countryName: String?
+    let isCancelled: Bool?
+}
+
+struct OFDriver: Codable {
+    let driverNumber: Int
+    let nameAcronym: String?
+    let teamColour: String?
+}
+
+struct OFResult: Codable {
+    let position: Int?
+    let driverNumber: Int
+    let duration: LapValue?
+}
+
+struct OFLap: Codable {
+    let driverNumber: Int
+    let lapDuration: Double?
+}
+
+/// A best lap in seconds: one number (practice) or [Q1, Q2, Q3] with nulls (qualifying, uses the last time set)
+struct LapValue: Codable {
+    let seconds: Double?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let one = try? container.decode(Double.self) {
+            seconds = one
+        } else if let many = try? container.decode([Double?].self) {
+            seconds = many.last(where: { $0 != nil }) ?? nil
+        } else {
+            seconds = nil
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(seconds)
+    }
+}
+
+/// Top 10 of the latest finished session, ready to display (also kept in the cache)
+struct BoardRow: Codable {
+    let position: Int
+    let code: String
+    let colour: String?
+    let time: String
+    let fastest: Bool?           // optional so caches from older versions still load
+}
+
+struct SessionBoard: Codable {
+    let title: String
+    let rows: [BoardRow]
 }
 
 // MARK: - Time
@@ -155,6 +293,48 @@ func countdown(_ interval: TimeInterval) -> String {
 func short(_ raceName: String) -> String {
     raceName.replacingOccurrences(of: "Grand Prix", with: "GP")
 }
+
+/// OpenF1 timestamps look like "2026-11-28T15:30:00+00:00"
+func isoDate(_ text: String) -> Date? {
+    isoFormatter.date(from: text)
+}
+
+/// 84.567 → "1:24.567"
+func lapText(_ seconds: Double) -> String {
+    let minutes = Int(seconds) / 60
+    let rest = seconds - Double(minutes * 60)
+    return minutes > 0 ? String(format: "%d:%06.3f", minutes, rest) : String(format: "%.3f", rest)
+}
+
+/// "Practice 1" → "FP1", "Qualifying" → "Quali" …
+func shortSession(_ name: String) -> String {
+    switch name {
+    case "Practice 1": return "FP1"
+    case "Practice 2": return "FP2"
+    case "Practice 3": return "FP3"
+    case "Qualifying": return "Quali"
+    case "Sprint Qualifying", "Sprint Shootout": return "Sprint Quali"
+    default: return name
+    }
+}
+
+/// "Alpine F1 Team" → "Alpine", "RB F1 Team" → "Racing Bulls"
+func teamName(_ constructor: StandingConstructor) -> String {
+    if constructor.constructorId == "rb" { return "Racing Bulls" }
+    return constructor.name.replacingOccurrences(of: " F1 Team", with: "")
+}
+
+/// "FF8000" → NSColor
+func colour(hex: String?) -> NSColor? {
+    guard let hex = hex?.replacingOccurrences(of: "#", with: ""), hex.count == 6,
+          let value = Int(hex, radix: 16) else { return nil }
+    return NSColor(srgbRed: CGFloat((value >> 16) & 0xFF) / 255, green: CGFloat((value >> 8) & 0xFF) / 255,
+                   blue: CGFloat(value & 0xFF) / 255, alpha: 1)
+}
+
+let gold = NSColor(srgbRed: 0.85, green: 0.65, blue: 0.13, alpha: 1)
+let silver = NSColor(srgbRed: 0.66, green: 0.67, blue: 0.70, alpha: 1)
+let bronze = NSColor(srgbRed: 0.80, green: 0.50, blue: 0.20, alpha: 1)
 
 // MARK: - Panel content
 
@@ -238,6 +418,40 @@ func buildRows(_ seasons: [Season], now: Date = Date()) -> [Row] {
     return rows
 }
 
+// MARK: - Championship maths
+
+/// Most points one driver / one team can still score: every race and sprint that is still to come or not yet
+/// counted in the standings (current rules: race 25 / 18, sprint 8 / 7, no fastest-lap point)
+func pointsStillAvailable(races: [Race], standingsRound: Int, now: Date = Date()) -> (driver: Double, team: Double) {
+    var driver = 0.0, team = 0.0
+    for race in races {
+        let pending = (Int(race.round) ?? 0) > standingsRound
+        if pending || race.finishedBy > now {
+            driver += 25
+            team += 25 + 18
+        }
+        if let sprint = race.sprint, let start = makeDate(sprint.date, sprint.time)?.date,
+           pending || start.addingTimeInterval(2 * 3600) > now {
+            driver += 8
+            team += 8 + 7
+        }
+    }
+    return (driver, team)
+}
+
+/// 1-based positions that can no longer change: both the gap to the one ahead and the gap to the one behind
+/// are bigger than what is still available (equal points could still go either way on countback)
+func lockedPositions(_ points: [Double], available: Double) -> Set<Int> {
+    if available <= 0 { return Set(points.indices.map { $0 + 1 }) }
+    var locked = Set<Int>()
+    for i in points.indices {
+        let safeAhead = i == 0 || points[i - 1] - points[i] > available
+        let safeBehind = i == points.count - 1 || points[i] - points[i + 1] > available
+        if safeAhead && safeBehind { locked.insert(i + 1) }
+    }
+    return locked
+}
+
 // MARK: - Sync and cache
 
 struct HTTPStatusError: LocalizedError {
@@ -265,11 +479,40 @@ enum API {
         if let next = try? await season(year + 1), !next.races.isEmpty { return [this, next] }
         return [this]
     }
+
+    /// GET a JSON endpoint and decode it
+    static func get<T: Decodable>(_ type: T.Type, _ url: String, snakeCase: Bool = false) async throws -> T {
+        guard let address = URL(string: url) else { throw AppError(message: "bad URL") }
+        var request = URLRequest(url: address)
+        request.timeoutInterval = 20
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw HTTPStatusError(code: http.statusCode)
+        }
+        let decoder = JSONDecoder()
+        if snakeCase { decoder.keyDecodingStrategy = .convertFromSnakeCase }
+        return try decoder.decode(T.self, from: data)
+    }
+
+    /// Driver and constructor standings; before a season's first race, falls back to the previous season
+    static func standings(year: Int) async throws -> Standings {
+        for season in [year, year - 1] {
+            let base = "https://api.jolpi.ca/ergast/f1/\(season)"
+            let drivers = try await get(StandingsResponse<DriverStanding>.self, base + "/driverstandings.json?limit=100")
+            guard !drivers.items.isEmpty else { continue }
+            let teams = try await get(StandingsResponse<TeamStanding>.self, base + "/constructorstandings.json?limit=100")
+            return Standings(season: season, round: drivers.round, drivers: drivers.items, teams: teams.items)
+        }
+        throw AppError(message: "no standings yet")
+    }
 }
 
 struct Cache: Codable {
     let fetchedAt: Date
     let seasons: [Season]
+    var standings: Standings? = nil
+    var board: SessionBoard? = nil
+    var colours: [String: String]? = nil   // driver code → team colour (hex), from OpenF1
 }
 
 enum Store {
@@ -292,7 +535,7 @@ enum Store {
 
 // MARK: - Circuit map (the "detailed" map on each formula1.com race page)
 
-struct MapError: LocalizedError {
+struct AppError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
 }
@@ -324,7 +567,7 @@ enum TrackMap {
     }
 
     static func imageURL(for race: Race) async throws -> URL {
-        var failure: Error = MapError(message: "no map on the F1 race page")
+        var failure: Error = AppError(message: "no map on the F1 race page")
         for slug in pageSlugs(race) {
             guard let page = URL(string: "https://www.formula1.com/en/racing/\(race.season)/\(slug)") else { continue }
             do {
@@ -364,7 +607,7 @@ enum TrackMap {
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             throw HTTPStatusError(code: http.statusCode)
         }
-        guard let image = NSImage(data: data) else { throw MapError(message: "unreadable image") }
+        guard let image = NSImage(data: data) else { throw AppError(message: "unreadable image") }
         try? data.write(to: file)
         return image
     }
@@ -390,6 +633,92 @@ func wantsDarkBackground(_ image: NSImage) -> Bool {
         weight += alpha
     }
     return weight > 0 && sum / weight > 0.6
+}
+
+// MARK: - Latest session top 10 (OpenF1)
+
+enum OpenF1 {
+    static let base = "https://api.openf1.org/v1/"
+
+    /// The free tier allows 3 requests a second: wait a little before each call, and retry once if throttled (HTTP 429)
+    private static func fetch<T: Decodable>(_ type: T.Type, _ path: String) async throws -> T {
+        try await Task.sleep(nanoseconds: 400_000_000)
+        do {
+            return try await API.get(type, base + path, snakeCase: true)
+        } catch let error as HTTPStatusError where error.code == 429 {
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            return try await API.get(type, base + path, snakeCase: true)
+        }
+    }
+
+    /// The most recent session that ended at least 30 minutes ago (OpenF1 treats data as live, and paid,
+    /// until then). Practice is ordered by best lap; qualifying, sprint and race by classification.
+    /// Also returns every driver's team colour (driver code → hex).
+    static func latestBoard(now: Date = Date()) async throws -> (board: SessionBoard, colours: [String: String]) {
+        let year = Calendar(identifier: .gregorian).component(.year, from: now)
+        var finished: [OFSession] = []
+        for season in [year, year - 1] where finished.isEmpty {
+            finished = try await fetch([OFSession].self, "sessions?year=\(season)").filter {
+                guard $0.isCancelled != true, let end = $0.dateEnd.flatMap(isoDate) else { return false }
+                return end.addingTimeInterval(30 * 60) <= now
+            }
+        }
+        guard let session = finished.max(by: {
+            ($0.dateEnd.flatMap(isoDate) ?? .distantPast) < ($1.dateEnd.flatMap(isoDate) ?? .distantPast)
+        })
+        else { throw AppError(message: "no finished session yet") }
+
+        let key = session.sessionKey
+        let drivers = try await fetch([OFDriver].self, "drivers?session_key=\(key)")
+        let results = try await fetch([OFResult].self, "session_result?session_key=\(key)")
+
+        var codes: [Int: String] = [:]
+        var colours: [String: String] = [:]
+        for driver in drivers {
+            guard let code = driver.nameAcronym else { continue }
+            codes[driver.driverNumber] = code
+            if let hex = driver.teamColour { colours[code] = hex }
+        }
+
+        // Best lap per driver: practice and qualifying come with it; for a sprint or race, take it from the laps
+        let name = session.sessionName
+        let isPractice = name.hasPrefix("Practice") || name.hasPrefix("Day")
+        var best: [Int: Double] = [:]
+        if name == "Race" || name == "Sprint" {
+            let laps = try await fetch([OFLap].self, "laps?session_key=\(key)")
+            for lap in laps {
+                guard let time = lap.lapDuration, time > 0 else { continue }
+                best[lap.driverNumber] = min(best[lap.driverNumber] ?? time, time)
+            }
+        } else {
+            for result in results {
+                if let time = result.duration?.seconds { best[result.driverNumber] = time }
+            }
+        }
+
+        let ordered: [OFResult]
+        if isPractice {
+            ordered = results.filter { best[$0.driverNumber] != nil }
+                .sorted { (best[$0.driverNumber] ?? .infinity) < (best[$1.driverNumber] ?? .infinity) }
+        } else {
+            ordered = results.filter { $0.position != nil }
+                .sorted { ($0.position ?? Int.max) < ($1.position ?? Int.max) }
+        }
+
+        let fastest = best.values.min()
+        var rows: [BoardRow] = []
+        for (index, result) in ordered.prefix(10).enumerated() {
+            let code = codes[result.driverNumber] ?? "#\(result.driverNumber)"
+            let time = best[result.driverNumber]
+            rows.append(BoardRow(position: isPractice ? index + 1 : (result.position ?? index + 1),
+                                 code: code,
+                                 colour: colours[code],
+                                 time: time.map(lapText) ?? "—",
+                                 fastest: time != nil && time == fastest))
+        }
+        let place = session.location ?? session.countryName ?? ""
+        return (SessionBoard(title: "\(place) · \(shortSession(name))", rows: rows), colours)
+    }
 }
 
 // MARK: - Dropdown panel
@@ -501,6 +830,40 @@ final class MapView: NSView {
 /// The whole dropdown panel: circuit map on the left, schedule on the right, status and buttons along the bottom.
 /// It is the menu's only item, so it appears and disappears together with the menu.
 /// Pointer enters the map → the map grows to cover the panel; pointer leaves the panel → it shrinks back.
+/// What the three tables under the map show
+struct TeamRow {
+    let position: String
+    let name: String
+    let colour: NSColor?         // team colour
+    let points: String
+    let pointsColour: NSColor?   // gold once the title is decided, team colour otherwise
+}
+
+struct DriverRow {
+    let position: String
+    let code: String
+    let colour: NSColor?         // team colour
+    let points: String
+    let pointsColour: NSColor?   // gold / silver / bronze once P1 / P2 / P3 is decided
+}
+
+struct LapRow {
+    let position: String
+    let code: String
+    let colour: NSColor?         // team colour
+    let time: String
+    let fastest: Bool            // fastest lap of the session, shown in purple
+}
+
+struct Tables {
+    var teams: [TeamRow] = []
+    var drivers: [DriverRow] = []
+    var sessionTitle = ""
+    var laps: [LapRow] = []
+
+    var isEmpty: Bool { teams.isEmpty && drivers.isEmpty && laps.isEmpty }
+}
+
 final class DashboardView: NSView {
     static let mapWidth: CGFloat = 360
     let map = MapView(frame: .zero)
@@ -509,6 +872,7 @@ final class DashboardView: NSView {
     var onQuit: () -> Void = {}
 
     private var labels: [NSView] = []
+    private var tableViews: [NSView] = []
     private let footerLine = NSBox()
     private let noteLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
@@ -543,9 +907,12 @@ final class DashboardView: NSView {
         return nil
     }
 
-    func update(rows: [Row], image: NSImage?, showMap: Bool, note: String?, status: String, loginOn: Bool) {
+    func update(rows: [Row], image: NSImage?, showMap: Bool, tables: Tables,
+                note: String?, status: String, loginOn: Bool) {
         labels.forEach { $0.removeFromSuperview() }
         labels = rows.map { makeView($0) }
+        tableViews.forEach { $0.removeFromSuperview() }
+        tableViews = []
 
         let pad: CGFloat = 14, gap: CGFloat = 18
         let infoX = showMap ? pad + Self.mapWidth + gap : pad
@@ -584,9 +951,16 @@ final class DashboardView: NSView {
         noteLabel.isHidden = note == nil
         let buttons: [NSView] = [loginBox, syncButton, quitButton]
         let buttonsWidth = buttons.reduce(CGFloat(0)) { $0 + $1.fittingSize.width } + 14 * CGFloat(buttons.count - 1)
-        let width = max(infoX + infoWidth + pad, pad + 120 + 20 + buttonsWidth + pad)
+        let tablesWidth: CGFloat = tables.isEmpty ? 0 : pad * 2 + gap * 2 + 3 * 150
+        let width = max(infoX + infoWidth + pad, pad + 120 + 20 + buttonsWidth + pad, tablesWidth)
 
         var bottom = pad + max(infoHeight, mapHeight)
+
+        // Middle: constructors, top 10 drivers, latest session top 10 — three columns side by side
+        if !tables.isEmpty {
+            bottom = placeTables(tables, top: bottom + 16, width: width)
+        }
+
         if note != nil {
             bottom += 8
             noteLabel.frame = NSRect(x: pad, y: bottom, width: width - pad * 2, height: noteLabel.fittingSize.height)
@@ -624,6 +998,85 @@ final class DashboardView: NSView {
             mapRect = .zero
         }
         updateTrackingAreas()
+    }
+
+    /// Three columns under the map; returns the y where they end
+    private func placeTables(_ tables: Tables, top: CGFloat, width: CGFloat) -> CGFloat {
+        let pad: CGFloat = 14, gap: CGFloat = 18, rowHeight: CGFloat = 19
+        let column = (width - pad * 2 - gap * 2) / 3
+        var bottom = top
+
+        func put(_ view: NSView, _ frame: NSRect) {
+            view.frame = frame
+            addSubview(view)
+            tableViews.append(view)
+        }
+        func header(_ title: String, x: CGFloat) {
+            put(makeText(title.uppercased(), size: 11, weight: .semibold, colour: .secondaryLabelColor),
+                NSRect(x: x, y: top, width: column, height: 15))
+        }
+
+        // Constructors: position, team name in team colour, points (gold once the title is decided, team colour otherwise)
+        var x = pad
+        if !tables.teams.isEmpty {
+            header("Constructors", x: x)
+            var y = top + 21
+            for row in tables.teams {
+                put(makeText(row.position, colour: .secondaryLabelColor, align: .right),
+                    NSRect(x: x, y: y, width: 24, height: 16))
+                put(makeText(row.name, weight: .semibold, colour: row.colour),
+                    NSRect(x: x + 32, y: y, width: column - 32 - 56, height: 16))
+                put(makeText(row.points, weight: .semibold, colour: row.pointsColour, align: .right),
+                    NSRect(x: x + column - 56, y: y, width: 56, height: 16))
+                y += rowHeight
+            }
+            bottom = max(bottom, y)
+        }
+
+        // Drivers: position, code in team colour, points (gold / silver / bronze once that place is decided)
+        x += column + gap
+        if !tables.drivers.isEmpty {
+            header("Drivers", x: x)
+            var y = top + 21
+            for row in tables.drivers {
+                put(makeText(row.position, colour: .secondaryLabelColor, align: .right),
+                    NSRect(x: x, y: y, width: 24, height: 16))
+                put(makeText(row.code, weight: .bold, colour: row.colour),
+                    NSRect(x: x + 32, y: y, width: 44, height: 16))
+                put(makeText(row.points, weight: .semibold, colour: row.pointsColour, align: .right),
+                    NSRect(x: x + 82, y: y, width: column - 82, height: 16))
+                y += rowHeight
+            }
+            bottom = max(bottom, y)
+        }
+
+        // Latest session: position, code in team colour, best lap (purple = fastest of the session)
+        x += column + gap
+        if !tables.laps.isEmpty {
+            header(tables.sessionTitle, x: x)
+            var y = top + 21
+            for row in tables.laps {
+                put(makeText(row.position, colour: .secondaryLabelColor, align: .right),
+                    NSRect(x: x, y: y, width: 24, height: 16))
+                put(makeText(row.code, weight: .bold, colour: row.colour),
+                    NSRect(x: x + 32, y: y, width: 44, height: 16))
+                put(makeText(row.time, colour: row.fastest ? NSColor.systemPurple : nil, align: .right),
+                    NSRect(x: x + 76, y: y, width: column - 76, height: 16))
+                y += rowHeight
+            }
+            bottom = max(bottom, y)
+        }
+        return bottom
+    }
+
+    private func makeText(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular,
+                          colour: NSColor? = nil, align: NSTextAlignment = .left) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .monospacedDigitSystemFont(ofSize: size, weight: weight)
+        label.textColor = colour ?? .labelColor
+        label.alignment = align
+        label.lineBreakMode = .byTruncatingTail
+        return label
     }
 
     // Two tracking areas: entering the map enlarges it; only leaving the whole panel shrinks it back
@@ -710,6 +1163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var maps: [String: NSImage] = [:]
     private var mapLoading: Set<String> = []
     private var mapError: String?
+    private var boardError: String?   // why the latest session couldn't be loaded
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Icon: Resources/MenuIcon.png (and @2x) inside the app, copied there by build.sh
@@ -757,7 +1211,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             do {
                 let seasons = try await API.sync()
-                let fresh = Cache(fetchedAt: Date(), seasons: seasons)
+                var fresh = Cache(fetchedAt: Date(), seasons: seasons)
+                // Standings and the latest session are extras: if one fails, keep the last copy
+                let year = seasons.first?.year ?? Calendar(identifier: .gregorian).component(.year, from: Date())
+                fresh.standings = (try? await API.standings(year: year)) ?? self.cache?.standings
+                do {
+                    let latest = try await OpenF1.latestBoard()
+                    fresh.board = latest.board
+                    fresh.colours = latest.colours
+                    self.boardError = nil
+                } catch {
+                    fresh.board = self.cache?.board
+                    fresh.colours = self.cache?.colours
+                    self.boardError = error.localizedDescription
+                }
                 self.cache = fresh
                 self.lastError = nil
                 Store.save(fresh)
@@ -814,10 +1281,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if let t = cache?.fetchedAt {
             status = "Synced \(clockFormatter.string(from: t))"
         }
-        let note = (image == nil && !loading) ? mapError.map { "Track map failed: \($0)" } : nil
+        var notes: [String] = []
+        if image == nil, !loading, let error = mapError { notes.append("Track map failed: \(error)") }
+        if cache?.board == nil, let error = boardError { notes.append("Latest session failed: \(error)") }
+        let note = notes.isEmpty ? nil : notes.joined(separator: " · ")
 
-        dashboard.update(rows: rows, image: image, showMap: image != nil || loading,
+        dashboard.update(rows: rows, image: image, showMap: image != nil || loading, tables: makeTables(),
                          note: note, status: status, loginOn: SMAppService.mainApp.status == .enabled)
+    }
+
+    /// Constructors (name + points), top 10 drivers (code + points) and the latest session's top 10
+    private func makeTables() -> Tables {
+        var tables = Tables()
+        guard let cache = cache else { return tables }
+        let colours = cache.colours ?? [:]
+
+        if let standings = cache.standings {
+            let races = cache.seasons.first { $0.year == standings.season }?.races ?? []
+            let available = pointsStillAvailable(races: races, standingsRound: standings.round)
+
+            // A team's colour = the colour of one of its drivers (driver's latest team)
+            var teamColour: [String: NSColor] = [:]
+            for entry in standings.drivers {
+                guard let team = entry.constructors.last?.constructorId, teamColour[team] == nil,
+                      let code = entry.driver.code, let c = colour(hex: colours[code]) else { continue }
+                teamColour[team] = c
+            }
+
+            // Constructors: the champion's points turn gold once nobody can catch them, others use the team colour
+            let teamLocked = lockedPositions(standings.teams.map { Double($0.points) ?? 0 }, available: available.team)
+            for (index, entry) in standings.teams.enumerated() {
+                let id = entry.constructor.constructorId
+                let champion = index == 0 && teamLocked.contains(1)
+                tables.teams.append(TeamRow(position: entry.position ?? "–", name: teamName(entry.constructor),
+                                            colour: teamColour[id], points: entry.points,
+                                            pointsColour: champion ? gold : teamColour[id]))
+            }
+
+            // Drivers: P1–P3 turn gold / silver / bronze once that place can't change any more
+            let driverLocked = lockedPositions(standings.drivers.map { Double($0.points) ?? 0 }, available: available.driver)
+            let medals = [gold, silver, bronze]
+            for (index, entry) in standings.drivers.prefix(10).enumerated() {
+                let code = entry.driver.code ?? String(entry.driver.familyName.prefix(3)).uppercased()
+                let medal = index < 3 && driverLocked.contains(index + 1) ? medals[index] : nil
+                let team = entry.constructors.last.flatMap { teamColour[$0.constructorId] }
+                tables.drivers.append(DriverRow(position: entry.position ?? "–", code: code,
+                                                colour: colour(hex: colours[code]) ?? team,
+                                                points: entry.points, pointsColour: medal))
+            }
+        }
+
+        if let board = cache.board {
+            tables.sessionTitle = board.title
+            tables.laps = board.rows.map {
+                LapRow(position: "\($0.position)", code: $0.code, colour: colour(hex: $0.colour),
+                       time: $0.time, fastest: $0.fastest ?? false)
+            }
+        }
+        return tables
     }
 
     private func toggleLogin() {
@@ -864,6 +1385,28 @@ struct PitBoardMain {
                         } catch {
                             print("Track map failed: \(error.localizedDescription)")
                         }
+                    }
+                    do {
+                        let standings = try await API.standings(year: seasons.first?.year ?? 0)
+                        print("---- Constructors after round \(standings.round)")
+                        for entry in standings.teams {
+                            print("\(entry.position ?? "–")\t\(teamName(entry.constructor))\t\(entry.points)")
+                        }
+                        print("---- Drivers")
+                        for entry in standings.drivers.prefix(10) {
+                            print("\(entry.position ?? "–")\t\(entry.driver.code ?? "?")\t\(entry.points)")
+                        }
+                    } catch {
+                        print("Standings failed: \(error.localizedDescription)")
+                    }
+                    do {
+                        let latest = try await OpenF1.latestBoard()
+                        print("---- \(latest.board.title)")
+                        for row in latest.board.rows {
+                            print("\(row.position)\t\(row.code)\t\(row.time)\(row.fastest == true ? "  fastest" : "")")
+                        }
+                    } catch {
+                        print("Latest session failed: \(error.localizedDescription)")
                     }
                 } catch {
                     print("Sync failed: \(error.localizedDescription)")
