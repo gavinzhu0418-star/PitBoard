@@ -2,7 +2,7 @@
 // Click the menu bar icon to sync this season's schedule. The panel shows the official circuit map for the
 // current round on the left (found on that round's formula1.com race page, downloaded once and cached; hover
 // over it and it smoothly grows to cover the whole panel), the round, every session in local time and a
-// countdown on the right. Under them: constructor standings, the top 10 drivers, and the top 10
+// countdown on the right. Under them: constructor standings, driver standings, and the full results
 // of the latest finished session. Sync status and buttons along the bottom.
 //
 // Data: schedule and standings from the Jolpica F1 API (the Ergast successor) https://api.jolpi.ca/ergast/f1/;
@@ -25,6 +25,8 @@ struct Slot: Codable {
 struct Location: Codable {
     let locality: String?
     let country: String?
+    let lat: String?    // for the weather forecast
+    let long: String?
 }
 
 struct Circuit: Codable {
@@ -151,6 +153,55 @@ struct Standings: Codable {
     let teams: [TeamStanding]
 }
 
+/// One race result with its fastest lap (Jolpica /results)
+struct RaceResult: Codable {
+    let driver: StandingDriver
+    let constructor: StandingConstructor
+    let fastestLap: FastestLap?
+
+    struct FastestLap: Codable {
+        let rank: String?
+        let time: LapTime?
+
+        struct LapTime: Codable {
+            let time: String?
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case rank
+            case time = "Time"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case driver = "Driver"
+        case constructor = "Constructor"
+        case fastestLap = "FastestLap"
+    }
+}
+
+/// MRData → RaceTable → Races[] → Results[], all races flattened
+struct ResultsResponse: Decodable {
+    let results: [RaceResult]
+
+    private enum Keys: String, CodingKey {
+        case mrData = "MRData", table = "RaceTable", races = "Races", results = "Results"
+    }
+
+    init(from decoder: Decoder) throws {
+        var races = try decoder.container(keyedBy: Keys.self)
+            .nestedContainer(keyedBy: Keys.self, forKey: .mrData)
+            .nestedContainer(keyedBy: Keys.self, forKey: .table)
+            .nestedUnkeyedContainer(forKey: .races)
+        var all: [RaceResult] = []
+        while !races.isAtEnd {
+            let race = try races.nestedContainer(keyedBy: Keys.self)
+            all += try race.decodeIfPresent([RaceResult].self, forKey: .results) ?? []
+        }
+        results = all
+    }
+}
+
 // MARK: - Session result models (OpenF1, decoded with convertFromSnakeCase)
 
 struct OFSession: Codable {
@@ -159,6 +210,7 @@ struct OFSession: Codable {
     let dateEnd: String?
     let location: String?
     let countryName: String?
+    let circuitShortName: String?
     let isCancelled: Bool?
 }
 
@@ -171,12 +223,51 @@ struct OFDriver: Codable {
 struct OFResult: Codable {
     let position: Int?
     let driverNumber: Int
-    let duration: LapValue?
+    let duration: LapValue?        // best lap (practice, qualifying) or total time (sprint, race)
+    let gapToLeader: GapValue?
+    let dnf: Bool?
+    let dns: Bool?
+    let dsq: Bool?
+}
+
+/// gap_to_leader: seconds behind the winner, or text such as "+1 LAP" (qualifying sends an array, not used)
+enum GapValue: Codable {
+    case seconds(Double)
+    case text(String)
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(Double.self) {
+            self = .seconds(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .text(value)
+        } else {
+            self = .unknown
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .seconds(let value): try container.encode(value)
+        case .text(let value): try container.encode(value)
+        case .unknown: try container.encodeNil()
+        }
+    }
 }
 
 struct OFLap: Codable {
     let driverNumber: Int
     let lapDuration: Double?
+}
+
+/// One tyre stint of one driver (OpenF1 /stints)
+struct OFStint: Codable {
+    let driverNumber: Int
+    let compound: String?
+    let lapStart: Int?
+    let lapEnd: Int?
 }
 
 /// A best lap in seconds: one number (practice) or [Q1, Q2, Q3] with nulls (qualifying, uses the last time set)
@@ -200,7 +291,7 @@ struct LapValue: Codable {
     }
 }
 
-/// Top 10 of the latest finished session, ready to display (also kept in the cache)
+/// One line of the latest finished session, ready to display (also kept in the cache); position 0 = unclassified
 struct BoardRow: Codable {
     let position: Int
     let code: String
@@ -212,6 +303,7 @@ struct BoardRow: Codable {
 struct SessionBoard: Codable {
     let title: String
     let rows: [BoardRow]
+    var fastestLap: BoardRow? = nil   // sprint and race: who set the fastest lap, shown under the results
 }
 
 // MARK: - Time
@@ -306,6 +398,31 @@ func lapText(_ seconds: Double) -> String {
     return minutes > 0 ? String(format: "%d:%06.3f", minutes, rest) : String(format: "%.3f", rest)
 }
 
+/// Total race time: 5504.742 → "1:31:44.742", 1844.2 → "30:44.200"
+func raceTime(_ seconds: Double) -> String {
+    let hours = Int(seconds) / 3600
+    let minutes = Int(seconds) % 3600 / 60
+    let rest = seconds - Double(hours * 3600 + minutes * 60)
+    return hours > 0 ? String(format: "%d:%02d:%06.3f", hours, minutes, rest)
+                     : String(format: "%d:%06.3f", minutes, rest)
+}
+
+/// Sprint / race result like the official classification: the winner's time, then "+5.123s", "+1 Lap", "DNF"
+func raceGap(_ result: OFResult, winner: Bool) -> String {
+    if result.dsq == true { return "DSQ" }
+    if result.dns == true { return "DNS" }
+    if result.dnf == true { return "DNF" }
+    if winner { return result.duration?.seconds.map(raceTime) ?? "—" }
+    switch result.gapToLeader {
+    case .seconds(let gap)?:
+        return String(format: "+%.3fs", gap)
+    case .text(let text)?:
+        return text.replacingOccurrences(of: "LAPS", with: "Laps").replacingOccurrences(of: "LAP", with: "Lap")
+    default:
+        return "—"
+    }
+}
+
 /// "Practice 1" → "FP1", "Qualifying" → "Quali" …
 func shortSession(_ name: String) -> String {
     switch name {
@@ -335,6 +452,28 @@ func colour(hex: String?) -> NSColor? {
 let gold = NSColor(srgbRed: 0.85, green: 0.65, blue: 0.13, alpha: 1)
 let silver = NSColor(srgbRed: 0.66, green: 0.67, blue: 0.70, alpha: 1)
 let bronze = NSColor(srgbRed: 0.80, green: 0.50, blue: 0.20, alpha: 1)
+
+/// Pirelli's hard tyre is white; on a light background that turns light grey so it stays visible
+let hardWhite = NSColor(name: nil) { appearance in
+    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .white : NSColor(white: 0.6, alpha: 1)
+}
+
+/// Sidewall colours by OpenF1 compound name
+func compoundColour(_ compound: String) -> NSColor {
+    switch compound.uppercased() {
+    case "SOFT": return .systemRed
+    case "MEDIUM": return .systemYellow
+    case "HARD": return hardWhite
+    case "INTERMEDIATE": return .systemGreen
+    case "WET": return .systemBlue
+    default: return .systemGray
+    }
+}
+
+/// The weekend's compounds in order: 0 = hard (white), 1 = medium (yellow), 2 = soft (red)
+func tyreColour(rank: Int) -> NSColor {
+    compoundColour(["HARD", "MEDIUM", "SOFT"][min(max(rank, 0), 2)])
+}
 
 // MARK: - Panel content
 
@@ -513,6 +652,7 @@ struct Cache: Codable {
     var standings: Standings? = nil
     var board: SessionBoard? = nil
     var colours: [String: String]? = nil   // driver code → team colour (hex), from OpenF1
+    var extras: [String: RaceExtras]? = nil   // "season-round" → tyres, circuit facts, last race here
 }
 
 enum Store {
@@ -545,12 +685,7 @@ enum TrackMap {
     /// Mostly the country name; a few exceptions are listed; the race name comes last
     /// (e.g. the 2026 Bahrain GP held in Malaysia still lives at "bahrain")
     static func pageSlugs(_ race: Race) -> [String] {
-        func slug(_ s: String) -> String {
-            s.folding(options: .diacriticInsensitive, locale: nil)
-                .lowercased()
-                .replacingOccurrences(of: " ", with: "-")
-                .filter { $0.isLetter || $0.isNumber || $0 == "-" }
-        }
+        func slug(_ s: String) -> String { urlSlug(s) }
         let special = [
             "americas": "united-states", "miami": "miami", "vegas": "las-vegas",
             "silverstone": "great-britain", "yas_marina": "united-arab-emirates",
@@ -635,7 +770,483 @@ func wantsDarkBackground(_ image: NSImage) -> Bool {
     return weight > 0 && sum / weight > 0.6
 }
 
-// MARK: - Latest session top 10 (OpenF1)
+// MARK: - Race extras: parsing (tyres, circuit facts, last race here)
+// The pages are prose, so every parser is strict: when it isn't sure it returns nil and the line is hidden.
+
+/// Capture groups of the first match ("" for a group that took no part), or nil when nothing matches
+func captures(_ pattern: String, in text: String) -> [String]? {
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return nil }
+    return (0..<match.numberOfRanges).map { index in
+        Range(match.range(at: index), in: text).map { String(text[$0]) } ?? ""
+    }
+}
+
+/// &amp; &quot; &#39; &nbsp; &#233; &#xE9; …
+func decodeEntities(_ s: String) -> String {
+    guard s.contains("&"),
+          let regex = try? NSRegularExpression(pattern: "&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);") else { return s }
+    let named = ["amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " "]
+    var result = ""
+    var last = s.startIndex
+    for match in regex.matches(in: s, range: NSRange(s.startIndex..., in: s)) {
+        guard let whole = Range(match.range, in: s), let nameRange = Range(match.range(at: 1), in: s) else { continue }
+        let name = String(s[nameRange])
+        let replacement: String?
+        if name.hasPrefix("#x") || name.hasPrefix("#X") {
+            replacement = UInt32(name.dropFirst(2), radix: 16).flatMap { Unicode.Scalar($0) }.map { String(Character($0)) }
+        } else if name.hasPrefix("#") {
+            replacement = UInt32(name.dropFirst(), radix: 10).flatMap { Unicode.Scalar($0) }.map { String(Character($0)) }
+        } else {
+            replacement = named[name]
+        }
+        result += s[last..<whole.lowerBound]
+        result += replacement ?? String(s[whole])
+        last = whole.upperBound
+    }
+    result += s[last...]
+    return result
+}
+
+/// A page's visible text: scripts and styles dropped, every tag turned into a line break, entities decoded
+func plainText(_ html: String) -> String {
+    var s = html.replacingOccurrences(of: #"<(script|style)\b[\s\S]*?</\1\s*>"#, with: " ",
+                                      options: [.regularExpression, .caseInsensitive])
+    s = s.replacingOccurrences(of: #"<[^>]*>"#, with: "\n", options: .regularExpression)
+    s = decodeEntities(s)
+    s = s.replacingOccurrences(of: #"[ \t\r\f\x{0B}\x{A0}]+"#, with: " ", options: .regularExpression)
+    s = s.replacingOccurrences(of: #" *\n\s*"#, with: "\n", options: .regularExpression)
+    return s.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// The "Circuit" box of a formula1.com race page
+struct CircuitFacts: Codable, Equatable {
+    var length: String?       // "5.419 km"
+    var laps: Int?
+    var recordTime: String?   // "1:22.384"
+    var recordName: String?   // "Lando Norris"
+    var recordYear: Int?
+}
+
+func parseCircuitFacts(_ text: String) -> CircuitFacts? {
+    let length = captures(#"Circuit Length\D{0,40}?(\d+(?:\.\d+)?)\s*km"#, in: text)
+    let laps = captures(#"Number of Laps\D{0,40}?(\d+)"#, in: text)
+    let record = captures(#"Fastest lap time\D{0,40}?(\d+:\d{2}\.\d{3})\s*([^()\d][^()]{0,60}?)\s*\((\d{4})\)"#, in: text)
+    guard length != nil || laps != nil || record != nil else { return nil }
+    var facts = CircuitFacts()
+    if let length = length { facts.length = length[1] + " km" }
+    if let laps = laps { facts.laps = Int(laps[1]) }
+    if let record = record {
+        facts.recordTime = record[1]
+        facts.recordName = record[2].split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        facts.recordYear = Int(record[3])
+    }
+    return facts
+}
+
+/// Pirelli's three compounds for the weekend from the "What tyres will…" article: the first three different
+/// C numbers that appear within 300 characters of each other, hardest (lowest number) first
+func parseCompounds(_ text: String) -> [Int]? {
+    guard let regex = try? NSRegularExpression(pattern: #"\bC([0-6])\b"#) else { return nil }
+    let ns = text as NSString
+    var found: [(position: Int, number: Int)] = []
+    for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+        if let number = Int(ns.substring(with: match.range(at: 1))) { found.append((match.range.location, number)) }
+    }
+    for (index, first) in found.enumerated() {
+        var seen: [Int] = []
+        for item in found[index...] {
+            if item.position - first.position > 300 { break }
+            if !seen.contains(item.number) {
+                seen.append(item.number)
+                if seen.count == 3 { return seen.sorted() }
+            }
+        }
+    }
+    return nil
+}
+
+/// [1, 2, 3] → ["C1 H", "C2 M", "C3 S"] (hard, medium, soft)
+func compoundLabels(_ numbers: [Int]) -> [String] {
+    zip(numbers, ["H", "M", "S"]).map { "C\($0) \($1)" }
+}
+
+/// A per-set lap limit ("a maximum stint length of 27 laps", "27-lap tyre limit", "…-27-lap-limit-…")
+func parseLapLimit(_ text: String) -> Int? {
+    let match = captures(#"(?i)maximum (?:stint length )?of (\d{2}) laps"#, in: text)
+        ?? captures(#"(?i)(\d{2})[- ]lap[- ](?:tyres?[- ])?limit"#, in: text)
+    return match.flatMap { Int($0[1]) }
+}
+
+/// Every formula1.com article link in a page or feed, made absolute
+func articleLinks(in html: String) -> [String] {
+    let text = html.replacingOccurrences(of: "\\/", with: "/")
+    guard let regex = try? NSRegularExpression(pattern: #"(?:https://www\.formula1\.com)?/en/latest/article/[A-Za-z0-9._-]+"#)
+    else { return [] }
+    let ns = text as NSString
+    return regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { match in
+        let link = ns.substring(with: match.range)
+        return link.hasPrefix("https://") ? link : "https://www.formula1.com" + link
+    }
+}
+
+/// The part of an article slug that names the race: "Qatar Grand Prix" → "qatar",
+/// "Bahrain Grand Prix in Malaysia" → "bahrain" (formula1.com cuts long slugs short: "…-2026-australian-grand.<id>")
+func raceKey(_ raceName: String) -> String {
+    let head = raceName.range(of: " Grand Prix").map { String(raceName[..<$0.lowerBound]) } ?? raceName
+    return urlSlug(head)
+}
+
+/// This race's "What tyres will the teams and drivers have for the <season> <race>" article; links to other
+/// races' articles (a race page or the feed can carry them) are ignored
+func tyreArticleURL(in html: String, season: Int, raceKey: String) -> URL? {
+    let link = articleLinks(in: html).first { $0.contains("/what-tyres-will") && $0.contains("-\(season)-\(raceKey)") }
+    return link.flatMap { URL(string: $0) }
+}
+
+/// A lap limit named in one of this race's article links, e.g. …/explained-why-theres-a-27-lap-limit-on-tyres-for-the-qatar-grand-prix
+func lapLimitFromLinks(in html: String, raceKey: String) -> Int? {
+    for link in articleLinks(in: html) where link.contains(raceKey) {
+        if let limit = parseLapLimit(link) { return limit }
+    }
+    return nil
+}
+
+/// Lowercase letters and digits only, accents removed: "Montréal" → "montreal", "yas_marina" → "yasmarina"
+func normalisedName(_ s: String?) -> String {
+    (s ?? "").folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        .lowercased()
+        .filter { $0.isLetter || $0.isNumber }
+}
+
+/// Is an OpenF1 race at the same circuit as a Jolpica race? Same country (Jolpica's USA / UK / UAE are spelt
+/// out in OpenF1) and a circuit or place name that is equal or a prefix of the other ("spa" / "spafrancorchamps").
+/// The country alone is never enough, so a new circuit (Madrid) never borrows another's race (Barcelona).
+func sameCircuit(id: String?, locality: String?, country: String?,
+                 ofCircuit: String?, ofLocation: String?, ofCountry: String?) -> Bool {
+    let aliases = ["usa": "unitedstates", "uk": "unitedkingdom", "uae": "unitedarabemirates"]
+    func countryKey(_ s: String?) -> String {
+        let key = normalisedName(s)
+        return aliases[key] ?? key
+    }
+    let mineCountry = countryKey(country)
+    guard !mineCountry.isEmpty, mineCountry == countryKey(ofCountry) else { return false }
+    let mine = [normalisedName(id), normalisedName(locality)].filter { $0.count >= 3 }
+    let theirs = [normalisedName(ofCircuit), normalisedName(ofLocation)].filter { $0.count >= 3 }
+    return mine.contains { a in theirs.contains { b in a == b || a.hasPrefix(b) || b.hasPrefix(a) } }
+}
+
+/// One stint of a race: compound and its first and last lap
+struct StintSpan: Codable, Equatable {
+    let compound: String   // SOFT, MEDIUM, HARD, INTERMEDIATE, WET (OpenF1 spelling)
+    let from: Int
+    let to: Int
+}
+
+/// The laps a driver pitted on: the last lap of every stint but the final one
+func pitLaps(_ stints: [StintSpan]) -> [Int] {
+    stints.sorted { $0.from < $1.from }.dropLast().map(\.to)
+}
+
+/// [7, 32] → "Pit L7 · L32", [] → "No stop"
+func pitText(_ laps: [Int]) -> String {
+    laps.isEmpty ? "No stop" : "Pit " + laps.map { "L\($0)" }.joined(separator: " · ")
+}
+
+/// Teams that were renamed, mapped to today's name, so an old lap record still gets a colour
+func teamLineage(_ constructorId: String) -> String {
+    let lineage = ["toro_rosso": "rb", "alphatauri": "rb", "renault": "alpine", "lotus_f1": "alpine",
+                   "force_india": "aston_martin", "racing_point": "aston_martin", "sauber": "audi",
+                   "alfa": "audi", "brawn": "mercedes"]
+    return lineage[constructorId] ?? constructorId
+}
+
+/// "Lando Norris" → "NOR", for when Jolpica has no code
+func fallbackCode(_ name: String) -> String {
+    String(name.split(separator: " ").last?.prefix(3) ?? "").uppercased()
+}
+
+/// "São Paulo Grand Prix" → "sao-paulo-grand-prix" (formula1.com URL style)
+func urlSlug(_ s: String) -> String {
+    s.folding(options: .diacriticInsensitive, locale: nil)
+        .lowercased()
+        .replacingOccurrences(of: " ", with: "-")
+        .filter { $0.isLetter || $0.isNumber || $0 == "-" }
+}
+
+// MARK: - Race extras: loading and caching
+
+/// Who set the lap record, and for which team (Jolpica constructorId)
+struct RecordHolder: Codable, Equatable {
+    let code: String
+    let constructorId: String
+}
+
+/// One of the top three in the last race on this circuit, with their stints
+struct StrategyRow: Codable {
+    let position: Int
+    let code: String
+    let colour: String?   // that year's team colour (hex)
+    let stints: [StintSpan]
+}
+
+struct PastStrategy: Codable {
+    let place: String     // "Lusail"
+    let year: Int
+    let laps: Int         // race length, for scaling the bars
+    let rows: [StrategyRow]
+}
+
+/// Everything extra about one round, cached; every field optional so older caches still load
+struct RaceExtras: Codable {
+    var facts: CircuitFacts?
+    var compounds: [Int]?        // [1, 2, 3] = C1 hard, C2 medium, C3 soft
+    var lapLimit: Int?           // laps allowed per set, when Pirelli sets one
+    var webCheckedAt: Date?      // last look at formula1.com
+    var record: RecordHolder?
+    var recordDone: Bool?        // record holder looked up (or there is no record)
+    var past: PastStrategy?
+    var pastDone: Bool?          // last race here looked up (found or not)
+    var weather: [WeatherPoint]? // race start, +1 h, +2 h (Open-Meteo)
+    var weatherAt: Date?         // last successful forecast request
+}
+
+/// formula1.com: look again at most every 6 hours until both the circuit facts and the compounds are known
+/// (the tyre article only appears in race week)
+func needsWeb(_ extras: RaceExtras?, now: Date) -> Bool {
+    guard let extras = extras else { return true }
+    if extras.facts != nil && extras.compounds != nil { return false }
+    guard let checked = extras.webCheckedAt else { return true }
+    return now.timeIntervalSince(checked) >= 6 * 3600
+}
+
+/// A look at formula1.com only counts when the server answered; offline, the next sync tries again
+func nextWebCheck(previous: Date?, now: Date, reached: Bool) -> Date? {
+    reached ? now : previous
+}
+
+/// OpenF1 last race here: once per round, again on the next sync if it failed
+func needsPast(_ extras: RaceExtras?) -> Bool {
+    extras?.pastDone != true
+}
+
+/// Jolpica record holder: needs the race page's facts first, then once per round
+func needsRecord(_ extras: RaceExtras?) -> Bool {
+    extras?.facts != nil && extras?.recordDone != true
+}
+
+/// The top three of a race with their stints in order; drivers without stint data are left out
+func buildPastStrategy(place: String, year: Int, results: [OFResult], drivers: [OFDriver],
+                       stints: [OFStint]) -> PastStrategy? {
+    var info: [Int: OFDriver] = [:]
+    for driver in drivers { info[driver.driverNumber] = driver }
+    var byDriver: [Int: [StintSpan]] = [:]
+    for stint in stints {
+        guard let from = stint.lapStart, let to = stint.lapEnd else { continue }
+        byDriver[stint.driverNumber, default: []].append(StintSpan(compound: stint.compound ?? "UNKNOWN", from: from, to: to))
+    }
+    let podium = results.compactMap { result -> (position: Int, number: Int)? in
+        guard let position = result.position, (1...3).contains(position) else { return nil }
+        return (position, result.driverNumber)
+    }.sorted { $0.position < $1.position }
+
+    var rows: [StrategyRow] = []
+    for entry in podium {
+        let spans = (byDriver[entry.number] ?? []).sorted { $0.from < $1.from }
+        guard !spans.isEmpty else { continue }
+        let driver = info[entry.number]
+        rows.append(StrategyRow(position: entry.position, code: driver?.nameAcronym ?? "#\(entry.number)",
+                                colour: driver?.teamColour, stints: spans))
+    }
+    guard !rows.isEmpty else { return nil }
+    let laps = rows.flatMap { $0.stints.map(\.to) }.max() ?? 0
+    return PastStrategy(place: place, year: year, laps: laps, rows: rows)
+}
+
+/// The result whose fastest lap equals the record time (else the fastest lap of the race)
+func pickRecordHolder(_ results: [RaceResult], time: String) -> RecordHolder? {
+    guard let match = results.first(where: { $0.fastestLap?.time?.time == time })
+            ?? results.first(where: { $0.fastestLap?.rank == "1" }) else { return nil }
+    return RecordHolder(code: match.driver.code ?? fallbackCode(match.driver.familyName),
+                        constructorId: match.constructor.constructorId)
+}
+
+extension API {
+    /// The lap record holder's code and team that year (Jolpica, all races on this circuit that year)
+    static func recordHolder(year: Int, circuitId: String, time: String) async throws -> RecordHolder? {
+        let url = "https://api.jolpi.ca/ergast/f1/\(year)/circuits/\(circuitId)/results.json?limit=100"
+        let response = try await get(ResultsResponse.self, url)
+        return pickRecordHolder(response.results, time: time)
+    }
+}
+
+enum RaceInfo {
+    /// formula1.com's news feed (only the latest 10 articles, so it's just a fallback for the race page's links)
+    static let feed = URL(string: "https://www.formula1.com/en/latest/all.xml")!
+
+    static func page(_ url: URL) async throws -> String {
+        let (data, response) = try await URLSession.shared.data(from: url)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw HTTPStatusError(code: http.statusCode)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Fill in whatever is still missing for one round. Never throws: a part that fails stays empty
+    /// and is tried again on a later sync.
+    static func refresh(_ race: Race, cached: RaceExtras?, now: Date = Date()) async -> RaceExtras {
+        var extras = cached ?? RaceExtras()
+        if needsWeb(cached, now: now) {
+            let reached = await loadWeb(race, into: &extras)
+            extras.webCheckedAt = nextWebCheck(previous: extras.webCheckedAt, now: now, reached: reached)
+        }
+        // A request that fails leaves its "done" flag unset, so a later sync tries again;
+        // an answer of "nothing there" (record before 2004, a new circuit) counts as done
+        if needsRecord(extras) {
+            if let facts = extras.facts, let time = facts.recordTime, let year = facts.recordYear,
+               let circuitId = race.circuit.circuitId {
+                do {
+                    extras.record = try await API.recordHolder(year: year, circuitId: circuitId, time: time)
+                    extras.recordDone = true
+                } catch {}
+            } else {
+                extras.recordDone = true   // a new circuit has no lap record yet
+            }
+        }
+        if needsPast(extras) {
+            do {
+                extras.past = try await OpenF1.pastStrategy(for: race)
+                extras.pastDone = true
+            } catch {}
+        }
+        // Race forecast: needs a known start time and the circuit's coordinates
+        if let start = makeDate(race.date, race.time), start.timeKnown,
+           needsWeather(extras, start: start.date, now: now),
+           let lat = race.circuit.location?.lat, let long = race.circuit.location?.long {
+            do {
+                extras.weather = try await Weather.forecast(lat: lat, long: long, start: start.date)
+                extras.weatherAt = now
+            } catch {}
+        }
+        return extras
+    }
+
+    /// The race page gives the circuit facts and, in race week, links to the tyre article and any lap-limit
+    /// article; the news feed is the fallback for those links; the tyre article names the compounds.
+    /// Returns whether formula1.com answered at all (any HTTP status), so being offline isn't counted as a check.
+    private static func loadWeb(_ race: Race, into extras: inout RaceExtras) async -> Bool {
+        let season = Int(race.season) ?? 0
+        let key = raceKey(race.raceName)
+        var reached = false
+        var tyreLink: URL?
+        var limit: Int?
+        for slug in TrackMap.pageSlugs(race) {
+            guard let url = URL(string: "https://www.formula1.com/en/racing/\(race.season)/\(slug)") else { continue }
+            let html: String
+            do {
+                html = try await page(url)
+                reached = true
+            } catch is HTTPStatusError {
+                reached = true   // the server answered (e.g. 404 for this slug): try the next one
+                continue
+            } catch {
+                continue
+            }
+            guard let facts = parseCircuitFacts(plainText(html)) else { continue }
+            extras.facts = facts
+            tyreLink = tyreArticleURL(in: html, season: season, raceKey: key)
+            limit = lapLimitFromLinks(in: html, raceKey: key)
+            break
+        }
+        if extras.compounds == nil, tyreLink == nil || limit == nil, let rss = try? await page(feed) {
+            reached = true
+            tyreLink = tyreLink ?? tyreArticleURL(in: rss, season: season, raceKey: key)
+            limit = limit ?? lapLimitFromLinks(in: rss, raceKey: key)
+        }
+        if extras.compounds == nil, let link = tyreLink, let html = try? await page(link) {
+            let text = plainText(html)
+            extras.compounds = parseCompounds(text)
+            limit = limit ?? parseLapLimit(text)
+        }
+        if let limit = limit { extras.lapLimit = limit }
+        return reached
+    }
+}
+
+// MARK: - Race weather (Open-Meteo)
+
+/// The forecast for one hour: WMO weather code and whether it's daylight
+struct WeatherPoint: Codable, Equatable {
+    let code: Int
+    let isDay: Bool
+}
+
+/// SF Symbol for a WMO weather code; clear and partly cloudy skies get a moon at night
+func weatherSymbol(code: Int, isDay: Bool) -> String {
+    switch code {
+    case 0, 1: return isDay ? "sun.max.fill" : "moon.stars.fill"
+    case 2: return isDay ? "cloud.sun.fill" : "cloud.moon.fill"
+    case 3: return "cloud.fill"
+    case 45, 48: return "cloud.fog.fill"
+    case 51...57: return "cloud.drizzle.fill"
+    case 61, 63, 66, 80, 81: return "cloud.rain.fill"
+    case 65, 67, 82: return "cloud.heavyrain.fill"
+    case 71...77, 85, 86: return "cloud.snow.fill"
+    case 95...99: return "cloud.bolt.rain.fill"
+    default: return "cloud.fill"
+    }
+}
+
+/// The hourly forecast at the race start, one hour in and two hours in (about the finish);
+/// nil when any of them is missing, so the panel never shows a partial forecast
+func pickRacePoints(times: [Int], codes: [Int?], isDay: [Int?], start: Date) -> [WeatherPoint]? {
+    var points: [WeatherPoint] = []
+    for offset in [0, 3600, 7200] {
+        let moment = Int(start.timeIntervalSince1970) + offset
+        guard let index = times.firstIndex(where: { $0 <= moment && moment < $0 + 3600 }),
+              index < codes.count, let code = codes[index] else { return nil }
+        let day = index < isDay.count ? (isDay[index] ?? 1) : 1
+        points.append(WeatherPoint(code: code, isDay: day == 1))
+    }
+    return points
+}
+
+/// Open-Meteo's hourly forecast (decoded with convertFromSnakeCase; times as Unix seconds)
+struct ForecastResponse: Decodable {
+    let hourly: Hourly
+
+    struct Hourly: Decodable {
+        let time: [Int]
+        let weatherCode: [Int?]
+        let isDay: [Int?]
+    }
+}
+
+enum Weather {
+    /// The forecast at the circuit for the race start, +1 h and +2 h; nil when those hours aren't covered yet
+    static func forecast(lat: String, long: String, start: Date) async throws -> [WeatherPoint]? {
+        let url = "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(long)"
+            + "&hourly=weather_code,is_day&timeformat=unixtime&forecast_days=16"
+        let response = try await API.get(ForecastResponse.self, url, snakeCase: true)
+        return pickRacePoints(times: response.hourly.time, codes: response.hourly.weatherCode,
+                              isDay: response.hourly.isDay, start: start)
+    }
+}
+
+/// Weather icons fill the space left under the session list: 3 pt margin above and below, 20–36 pt
+func weatherIconSize(available: CGFloat) -> CGFloat {
+    min(max(available - 6, 20), 36)
+}
+
+/// Ask for the forecast only when the race starts within 15 days (Open-Meteo looks 16 days ahead) and
+/// hasn't finished, at most once an hour
+func needsWeather(_ extras: RaceExtras?, start: Date, now: Date) -> Bool {
+    guard now < start.addingTimeInterval(2 * 3600), start.timeIntervalSince(now) < 15 * 86400 else { return false }
+    guard let fetched = extras?.weatherAt else { return true }
+    return now.timeIntervalSince(fetched) >= 3600
+}
+
+// MARK: - Latest session results (OpenF1)
 
 enum OpenF1 {
     static let base = "https://api.openf1.org/v1/"
@@ -683,8 +1294,9 @@ enum OpenF1 {
         // Best lap per driver: practice and qualifying come with it; for a sprint or race, take it from the laps
         let name = session.sessionName
         let isPractice = name.hasPrefix("Practice") || name.hasPrefix("Day")
+        let isRace = name == "Race" || name == "Sprint"
         var best: [Int: Double] = [:]
-        if name == "Race" || name == "Sprint" {
+        if isRace {
             let laps = try await fetch([OFLap].self, "laps?session_key=\(key)")
             for lap in laps {
                 guard let time = lap.lapDuration, time > 0 else { continue }
@@ -696,28 +1308,60 @@ enum OpenF1 {
             }
         }
 
-        let ordered: [OFResult]
-        if isPractice {
-            ordered = results.filter { best[$0.driverNumber] != nil }
-                .sorted { (best[$0.driverNumber] ?? .infinity) < (best[$1.driverNumber] ?? .infinity) }
-        } else {
-            ordered = results.filter { $0.position != nil }
-                .sorted { ($0.position ?? Int.max) < ($1.position ?? Int.max) }
+        // Everyone: practice fastest first (no lap time at the end); otherwise classification order
+        // (no position at the end); ties by car number so the order stays put between refreshes
+        let ordered = results.sorted { a, b in
+            let keyA = isPractice ? (best[a.driverNumber] ?? .infinity) : Double(a.position ?? Int.max)
+            let keyB = isPractice ? (best[b.driverNumber] ?? .infinity) : Double(b.position ?? Int.max)
+            return keyA != keyB ? keyA < keyB : a.driverNumber < b.driverNumber
         }
 
         let fastest = best.values.min()
         var rows: [BoardRow] = []
-        for (index, result) in ordered.prefix(10).enumerated() {
+        for (index, result) in ordered.enumerated() {
             let code = codes[result.driverNumber] ?? "#\(result.driverNumber)"
             let time = best[result.driverNumber]
-            rows.append(BoardRow(position: isPractice ? index + 1 : (result.position ?? index + 1),
+            // Sprint / race: winner's time, then the gap to the winner; practice / qualifying: best lap
+            rows.append(BoardRow(position: isPractice ? index + 1 : (result.position ?? 0),
                                  code: code,
                                  colour: colours[code],
-                                 time: time.map(lapText) ?? "—",
-                                 fastest: time != nil && time == fastest))
+                                 time: isRace ? raceGap(result, winner: index == 0) : (time.map(lapText) ?? "—"),
+                                 fastest: !isRace && time != nil && time == fastest))
         }
         let place = session.location ?? session.countryName ?? ""
-        return (SessionBoard(title: "\(place) · \(shortSession(name))", rows: rows), colours)
+        var board = SessionBoard(title: "\(place) · \(shortSession(name))", rows: rows)
+        // Sprint / race: whoever set the fastest lap gets a line of their own under the results
+        if isRace, let quickest = best.min(by: { $0.value < $1.value }) {
+            let code = codes[quickest.key] ?? "#\(quickest.key)"
+            board.fastestLap = BoardRow(position: 0, code: code, colour: colours[code],
+                                        time: lapText(quickest.value), fastest: true)
+        }
+        return (board, colours)
+    }
+}
+
+extension OpenF1 {
+    /// The most recent race on this circuit before this season (OpenF1 covers 2023 onwards): the top three
+    /// with their stints. nil when the circuit hasn't been raced in that time.
+    static func pastStrategy(for race: Race) async throws -> PastStrategy? {
+        let season = Int(race.season) ?? 0
+        guard season - 1 >= 2023 else { return nil }
+        for year in stride(from: season - 1, through: 2023, by: -1) {
+            let sessions = try await fetch([OFSession].self, "sessions?session_name=Race&year=\(year)")
+            guard let session = sessions.last(where: {
+                $0.isCancelled != true
+                    && sameCircuit(id: race.circuit.circuitId, locality: race.circuit.location?.locality,
+                                   country: race.circuit.location?.country,
+                                   ofCircuit: $0.circuitShortName, ofLocation: $0.location, ofCountry: $0.countryName)
+            }) else { continue }
+            let key = session.sessionKey
+            let results = try await fetch([OFResult].self, "session_result?session_key=\(key)")
+            let drivers = try await fetch([OFDriver].self, "drivers?session_key=\(key)")
+            let stints = try await fetch([OFStint].self, "stints?session_key=\(key)")
+            return buildPastStrategy(place: session.location ?? session.circuitShortName ?? race.circuit.circuitName,
+                                     year: year, results: results, drivers: drivers, stints: stints)
+        }
+        return nil
     }
 }
 
@@ -855,13 +1499,107 @@ struct LapRow {
     let fastest: Bool            // fastest lap of the session, shown in purple
 }
 
+/// One of last race's top three: code in that year's team colour, stints bar, pit laps
+struct StrategyLine {
+    let position: String
+    let code: String
+    let colour: NSColor?
+    let stints: [StintSpan]
+    let pits: String             // "Pit L7 · L32"
+}
+
+/// Shown under Constructors: this round's tyres, the last race on this circuit, circuit facts
+struct RaceBlock {
+    var compounds: [String] = []   // "C1 H", "C2 M", "C3 S"
+    var lapLimit: String?          // "Max 27 laps per set"
+    var pastTitle: String?         // "Lusail 2025 · Top 3"
+    var raceLaps = 0
+    var lines: [StrategyLine] = []
+    var length: String?
+    var laps: String?
+    var recordTime: String?
+    var recordCode: String?
+    var recordColour: NSColor?     // colour of the team he set it with; nil = grey
+    var recordYear: String?
+}
+
+/// Turn a round's cached extras into what the panel shows; nil when there's nothing to show.
+/// teamColour: today's colour per constructorId.
+func makeRaceBlock(_ extras: RaceExtras, teamColour: [String: NSColor]) -> RaceBlock? {
+    var block = RaceBlock()
+    if let numbers = extras.compounds { block.compounds = compoundLabels(numbers) }
+    block.lapLimit = extras.lapLimit.map { "Max \($0) laps per set" }
+    if let past = extras.past {
+        block.pastTitle = "\(past.place) \(past.year) · Top 3"
+        block.raceLaps = past.laps
+        block.lines = past.rows.map {
+            StrategyLine(position: "\($0.position)", code: $0.code, colour: colour(hex: $0.colour),
+                         stints: $0.stints, pits: pitText(pitLaps($0.stints)))
+        }
+    }
+    if let facts = extras.facts {
+        block.length = facts.length
+        block.laps = facts.laps.map { String($0) }
+        if let time = facts.recordTime {
+            block.recordTime = time
+            block.recordYear = facts.recordYear.map { String($0) }
+            if let holder = extras.record {
+                block.recordCode = holder.code
+                block.recordColour = teamColour[teamLineage(holder.constructorId)]
+            } else {
+                block.recordCode = facts.recordName.map { fallbackCode($0) }
+            }
+        }
+    }
+    let empty = block.compounds.isEmpty && block.lapLimit == nil && block.lines.isEmpty
+        && block.length == nil && block.laps == nil && block.recordTime == nil
+    return empty ? nil : block
+}
+
 struct Tables {
     var teams: [TeamRow] = []
     var drivers: [DriverRow] = []
     var sessionTitle = ""
     var laps: [LapRow] = []
+    var fastestLap: LapRow? = nil   // sprint / race only: an extra line under the results, time in purple
+    var race: RaceBlock? = nil      // under Constructors
+    var weather: [WeatherPoint] = []   // race start, +1 h, end: under the latest session
 
-    var isEmpty: Bool { teams.isEmpty && drivers.isEmpty && laps.isEmpty }
+    var isEmpty: Bool { teams.isEmpty && drivers.isEmpty && laps.isEmpty && race == nil && weather.isEmpty }
+}
+
+/// A race-long bar split into stints, coloured by compound, with a small gap at each pit stop
+final class StintBar: NSView {
+    private let stints: [StintSpan]
+    private let total: Int
+
+    init(stints: [StintSpan], total: Int) {
+        self.stints = stints
+        self.total = max(total, stints.map(\.to).max() ?? 1, 1)
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let scale = bounds.width / CGFloat(total)
+        for stint in stints {
+            var rect = NSRect(x: CGFloat(stint.from - 1) * scale, y: 0,
+                              width: CGFloat(stint.to - stint.from + 1) * scale, height: bounds.height)
+            if stint.to < total { rect.size.width -= 1.5 }
+            guard rect.width > 0 else { continue }
+            let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
+            compoundColour(stint.compound).setFill()
+            path.fill()
+            if stint.compound.uppercased() == "HARD" {   // keeps white visible on a light background
+                path.lineWidth = 0.5
+                NSColor.separatorColor.setStroke()
+                path.stroke()
+            }
+        }
+    }
 }
 
 final class DashboardView: NSView {
@@ -956,7 +1694,7 @@ final class DashboardView: NSView {
 
         var bottom = pad + max(infoHeight, mapHeight)
 
-        // Middle: constructors, top 10 drivers, latest session top 10 — three columns side by side
+        // Middle: constructors, drivers, latest session results — three columns side by side
         if !tables.isEmpty {
             bottom = placeTables(tables, top: bottom + 16, width: width)
         }
@@ -1011,9 +1749,89 @@ final class DashboardView: NSView {
             addSubview(view)
             tableViews.append(view)
         }
-        func header(_ title: String, x: CGFloat) {
+        func header(_ title: String, x: CGFloat, y: CGFloat? = nil) {
             put(makeText(title.uppercased(), size: 11, weight: .semibold, colour: .secondaryLabelColor),
-                NSRect(x: x, y: top, width: column, height: 15))
+                NSRect(x: x, y: y ?? top, width: column, height: 15))
+        }
+
+        // Under Constructors: this round's tyres, the last race on this circuit and the circuit facts,
+        // each part only when it has data; returns where it ends
+        func placeRace(_ race: RaceBlock, x: CGFloat, from start: CGFloat) -> CGFloat {
+            var y = start
+            if !race.compounds.isEmpty || race.lapLimit != nil {
+                header("Tyres", x: x, y: y)
+                y += 21
+                if !race.compounds.isEmpty {
+                    // Spread across the row: hard at the left edge, medium centred, soft at the right edge
+                    let third = column / 3
+                    let alignments: [NSTextAlignment] = [.left, .center, .right]
+                    for (rank, label) in race.compounds.enumerated() {
+                        put(makeText(label, weight: .semibold, colour: tyreColour(rank: rank),
+                                     align: alignments[min(rank, 2)]),
+                            NSRect(x: x + CGFloat(rank) * third, y: y, width: third, height: 16))
+                    }
+                    y += rowHeight
+                }
+                if let limit = race.lapLimit {
+                    put(makeText(limit, size: 11, colour: .secondaryLabelColor),
+                        NSRect(x: x, y: y, width: column, height: 16))
+                    y += rowHeight
+                }
+                y += 4
+            }
+            // Position, code in that year's team colour, stints bar, pit laps underneath
+            if let title = race.pastTitle, !race.lines.isEmpty {
+                header(title, x: x, y: y)
+                y += 21
+                for line in race.lines {
+                    put(makeText(line.position, colour: .secondaryLabelColor, align: .right),
+                        NSRect(x: x, y: y, width: 24, height: 16))
+                    put(makeText(line.code, weight: .bold, colour: line.colour),
+                        NSRect(x: x + 32, y: y, width: 36, height: 16))
+                    put(StintBar(stints: line.stints, total: race.raceLaps),
+                        NSRect(x: x + 70, y: y + 4, width: column - 70, height: 8))
+                    put(makeText(line.pits, size: 10, colour: .secondaryLabelColor),
+                        NSRect(x: x + 70, y: y + 14, width: column - 70, height: 13))
+                    y += 30
+                }
+                y += 4
+            }
+            if race.length != nil || race.laps != nil || race.recordTime != nil {
+                header("Circuit", x: x, y: y)
+                y += 21
+                let valueX: CGFloat = 58
+                for (label, value) in [("Length", race.length), ("Laps", race.laps)] {
+                    guard let value = value else { continue }
+                    put(makeText(label, colour: .secondaryLabelColor), NSRect(x: x, y: y, width: valueX - 2, height: 16))
+                    put(makeText(value), NSRect(x: x + valueX, y: y, width: column - valueX, height: 16))
+                    y += rowHeight
+                }
+                // Lap record: the year in full at the column's right edge (lined up with the points above),
+                // then the time and the holder's code (colour of the team he set it with) in the space left
+                if let time = race.recordTime {
+                    put(makeText("Lap rec.", colour: .secondaryLabelColor), NSRect(x: x, y: y, width: valueX - 2, height: 16))
+                    var right = x + column
+                    if let year = race.recordYear {
+                        let field = makeText(year, colour: .secondaryLabelColor)
+                        let width = field.fittingSize.width
+                        put(field, NSRect(x: right - width, y: y, width: width, height: 16))
+                        right -= width + 4
+                    }
+                    var cursor = x + valueX
+                    func add(_ field: NSTextField) {
+                        let width = min(field.fittingSize.width, right - cursor)
+                        guard width > 8 else { return }
+                        put(field, NSRect(x: cursor, y: y, width: width, height: 16))
+                        cursor += width + 4
+                    }
+                    add(makeText(time))
+                    if let code = race.recordCode {
+                        add(makeText(code, weight: .bold, colour: race.recordColour ?? .secondaryLabelColor))
+                    }
+                    y += rowHeight
+                }
+            }
+            return y
         }
 
         // Constructors: position, team name in team colour, points (gold once the title is decided, team colour otherwise)
@@ -1031,6 +1849,10 @@ final class DashboardView: NSView {
                 y += rowHeight
             }
             bottom = max(bottom, y)
+        }
+        if let race = tables.race {
+            // bottom is still where Constructors ends: nothing else has been placed yet
+            bottom = max(bottom, placeRace(race, x: x, from: tables.teams.isEmpty ? top : bottom + 8))
         }
 
         // Drivers: position, code in team colour, points (gold / silver / bronze once that place is decided)
@@ -1052,10 +1874,11 @@ final class DashboardView: NSView {
 
         // Latest session: position, code in team colour, best lap (purple = fastest of the session)
         x += column + gap
+        var rightBottom = top
         if !tables.laps.isEmpty {
             header(tables.sessionTitle, x: x)
             var y = top + 21
-            for row in tables.laps {
+            for row in tables.laps + (tables.fastestLap.map { [$0] } ?? []) {
                 put(makeText(row.position, colour: .secondaryLabelColor, align: .right),
                     NSRect(x: x, y: y, width: 24, height: 16))
                 put(makeText(row.code, weight: .bold, colour: row.colour),
@@ -1064,9 +1887,38 @@ final class DashboardView: NSView {
                     NSRect(x: x + 76, y: y, width: column - 76, height: 16))
                 y += rowHeight
             }
+            rightBottom = y
             bottom = max(bottom, y)
         }
+
+        // Under it: the race forecast (start › +1 h › end) as three icons spread across the column,
+        // as large as the space left at the bottom allows
+        if tables.weather.count == 3 {
+            let available = tables.laps.isEmpty ? 42 : bottom - rightBottom
+            let size = weatherIconSize(available: available)
+            let iconY = (tables.laps.isEmpty ? top : rightBottom) + max((available - size) / 2, 3)
+            let slot = column / 5   // icon, arrow, icon, arrow, icon
+            for (index, point) in tables.weather.enumerated() {
+                if index > 0 {
+                    put(makeText("›", size: 18, colour: .secondaryLabelColor, align: .center),
+                        NSRect(x: x + slot * CGFloat(index * 2 - 1), y: iconY + (size - 22) / 2, width: slot, height: 22))
+                }
+                put(weatherIcon(point, size: size),
+                    NSRect(x: x + slot * CGFloat(index * 2) + (slot - size) / 2, y: iconY, width: size, height: size))
+            }
+            bottom = max(bottom, iconY + size)
+        }
         return bottom
+    }
+
+    /// One forecast hour as a multicolour SF Symbol (sun, cloud, rain, …; moon at night), drawn to fit `size`
+    private func weatherIcon(_ point: WeatherPoint, size: CGFloat) -> NSImageView {
+        let name = weatherSymbol(code: point.code, isDay: point.isDay)
+        let config = NSImage.SymbolConfiguration(pointSize: size * 0.72, weight: .regular).applying(.preferringMulticolor())
+        let view = NSImageView(frame: .zero)
+        view.image = NSImage(systemSymbolName: name, accessibilityDescription: name)?.withSymbolConfiguration(config)
+        view.imageScaling = .scaleProportionallyDown
+        return view
     }
 
     private func makeText(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular,
@@ -1164,6 +2016,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mapLoading: Set<String> = []
     private var mapError: String?
     private var boardError: String?   // why the latest session couldn't be loaded
+    private var extrasLoading: Set<String> = []   // rounds whose tyres / circuit block is being fetched
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Icon: Resources/MenuIcon.png (and @2x) inside the app, copied there by build.sh
@@ -1195,6 +2048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         dashboard.map.setExpanded(false, animated: false)
         loadMap()
+        loadExtras()
         // Re-sync when the data is more than 10 minutes old
         if let t = cache?.fetchedAt, Date().timeIntervalSince(t) < 600 { return }
         sync()
@@ -1225,6 +2079,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     fresh.colours = self.cache?.colours
                     self.boardError = error.localizedDescription
                 }
+                fresh.extras = self.cache?.extras   // fetched separately by loadExtras(); keep them
                 self.cache = fresh
                 self.lastError = nil
                 Store.save(fresh)
@@ -1234,6 +2089,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.syncing = false
             self.rebuildMenu()
             self.loadMap()
+            self.loadExtras()
         }
     }
 
@@ -1265,6 +2121,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: Tyres, last race here, circuit facts
+
+    /// Fetch what's still missing for the round on screen (RaceInfo decides what that is), then cache it
+    private func loadExtras() {
+        guard let race = currentRace else { return }
+        let key = mapKey(race)
+        let cached = cache?.extras?[key]
+        let start = makeDate(race.date, race.time).flatMap { $0.timeKnown ? $0.date : nil }
+        let weatherDue = start.map { needsWeather(cached, start: $0, now: Date()) } ?? false
+        guard !extrasLoading.contains(key),
+              needsWeb(cached, now: Date()) || needsRecord(cached) || needsPast(cached) || weatherDue else { return }
+        extrasLoading.insert(key)
+        Task {
+            let fresh = await RaceInfo.refresh(race, cached: cached)
+            if self.cache != nil {
+                var all = self.cache?.extras ?? [:]
+                all[key] = fresh
+                self.cache?.extras = all
+                if let cache = self.cache { Store.save(cache) }
+            }
+            self.extrasLoading.remove(key)
+            self.rebuildMenu()
+        }
+    }
+
     // MARK: Panel content
 
     private func rebuildMenu() {
@@ -1290,18 +2171,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                          note: note, status: status, loginOn: SMAppService.mainApp.status == .enabled)
     }
 
-    /// Constructors (name + points), top 10 drivers (code + points) and the latest session's top 10
+    /// Constructors (name + points), all drivers (code + points) and the latest session's full results
     private func makeTables() -> Tables {
         var tables = Tables()
         guard let cache = cache else { return tables }
         let colours = cache.colours ?? [:]
 
+        // A team's colour = the colour of one of its drivers (driver's latest team); also used for the lap record
+        var teamColour: [String: NSColor] = [:]
         if let standings = cache.standings {
             let races = cache.seasons.first { $0.year == standings.season }?.races ?? []
             let available = pointsStillAvailable(races: races, standingsRound: standings.round)
 
-            // A team's colour = the colour of one of its drivers (driver's latest team)
-            var teamColour: [String: NSColor] = [:]
             for entry in standings.drivers {
                 guard let team = entry.constructors.last?.constructorId, teamColour[team] == nil,
                       let code = entry.driver.code, let c = colour(hex: colours[code]) else { continue }
@@ -1321,7 +2202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Drivers: P1–P3 turn gold / silver / bronze once that place can't change any more
             let driverLocked = lockedPositions(standings.drivers.map { Double($0.points) ?? 0 }, available: available.driver)
             let medals = [gold, silver, bronze]
-            for (index, entry) in standings.drivers.prefix(10).enumerated() {
+            for (index, entry) in standings.drivers.enumerated() {
                 let code = entry.driver.code ?? String(entry.driver.familyName.prefix(3)).uppercased()
                 let medal = index < 3 && driverLocked.contains(index + 1) ? medals[index] : nil
                 let team = entry.constructors.last.flatMap { teamColour[$0.constructorId] }
@@ -1333,10 +2214,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let board = cache.board {
             tables.sessionTitle = board.title
+            tables.fastestLap = board.fastestLap.map {
+                LapRow(position: "FL", code: $0.code, colour: colour(hex: $0.colour), time: $0.time, fastest: true)
+            }
             tables.laps = board.rows.map {
-                LapRow(position: "\($0.position)", code: $0.code, colour: colour(hex: $0.colour),
+                LapRow(position: $0.position > 0 ? "\($0.position)" : "–", code: $0.code, colour: colour(hex: $0.colour),
                        time: $0.time, fastest: $0.fastest ?? false)
             }
+        }
+
+        if let race = currentRace, let extras = cache.extras?[mapKey(race)] {
+            tables.race = makeRaceBlock(extras, teamColour: teamColour)
+            if let points = extras.weather, points.count == 3 { tables.weather = points }
         }
         return tables
     }
@@ -1385,6 +2274,34 @@ struct PitBoardMain {
                         } catch {
                             print("Track map failed: \(error.localizedDescription)")
                         }
+                        // The block under Constructors: tyres, last race on this circuit, circuit facts
+                        let extras = await RaceInfo.refresh(race, cached: nil)
+                        print("---- Tyres: " + (extras.compounds.map { compoundLabels($0).joined(separator: " · ") } ?? "not found yet"))
+                        if let limit = extras.lapLimit { print("Max \(limit) laps per set") }
+                        if let facts = extras.facts {
+                            print("Length \(facts.length ?? "?") · Laps \(facts.laps.map { String($0) } ?? "?")")
+                            if let time = facts.recordTime {
+                                let holder = extras.record.map { "\($0.code) (\($0.constructorId))" } ?? facts.recordName ?? "?"
+                                print("Lap record \(time) \(holder) \(facts.recordYear.map { String($0) } ?? "")")
+                            }
+                        } else {
+                            print("Circuit facts not found")
+                        }
+                        if let past = extras.past {
+                            print("---- \(past.place) \(past.year) · Top 3 (\(past.laps) laps)")
+                            for row in past.rows {
+                                let stints = row.stints.map { "\($0.compound.prefix(1))\($0.from)-\($0.to)" }.joined(separator: " ")
+                                print("\(row.position)\t\(row.code)\t\(stints)\t\(pitText(pitLaps(row.stints)))")
+                            }
+                        } else {
+                            print("No earlier race on this circuit in OpenF1 (2023 onwards)")
+                        }
+                        if let points = extras.weather {
+                            let icons = points.map { weatherSymbol(code: $0.code, isDay: $0.isDay) }
+                            print("Race weather (start › +1h › end): " + icons.joined(separator: " › "))
+                        } else {
+                            print("Race weather: no forecast yet (Open-Meteo looks 16 days ahead)")
+                        }
                     }
                     do {
                         let standings = try await API.standings(year: seasons.first?.year ?? 0)
@@ -1393,7 +2310,7 @@ struct PitBoardMain {
                             print("\(entry.position ?? "–")\t\(teamName(entry.constructor))\t\(entry.points)")
                         }
                         print("---- Drivers")
-                        for entry in standings.drivers.prefix(10) {
+                        for entry in standings.drivers {
                             print("\(entry.position ?? "–")\t\(entry.driver.code ?? "?")\t\(entry.points)")
                         }
                     } catch {
@@ -1404,6 +2321,9 @@ struct PitBoardMain {
                         print("---- \(latest.board.title)")
                         for row in latest.board.rows {
                             print("\(row.position)\t\(row.code)\t\(row.time)\(row.fastest == true ? "  fastest" : "")")
+                        }
+                        if let lap = latest.board.fastestLap {
+                            print("FL\t\(lap.code)\t\(lap.time)")
                         }
                     } catch {
                         print("Latest session failed: \(error.localizedDescription)")
